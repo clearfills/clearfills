@@ -416,6 +416,21 @@ class IBKRExecutionAdapter:
         last = _safe_float(getattr(ticker, "last", None), 0.0) if ticker is not None else 0.0
         close = _safe_float(getattr(ticker, "close", None), 0.0) if ticker is not None else 0.0
         vwap = _safe_float(getattr(ticker, "vwap", None), 0.0) if ticker is not None else 0.0
+
+        raw_mdt = getattr(ticker, "marketDataType", None) if ticker is not None else None
+        mdt_map = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
+        market_data_type = mdt_map.get(raw_mdt, "unknown")
+        is_delayed = raw_mdt in {3, 4}
+
+        quote_notes: list[str] = []
+        ref_price = last if last > 0 else ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+        if is_delayed:
+            quote_notes.append("Delayed IBKR snapshot (15-min delayed unless live US market data is subscribed).")
+        if close > 0 and ref_price > 0 and abs(ref_price - close) / close > 0.02 and (is_delayed or raw_mdt is None):
+            quote_notes.append(
+                "IBKR delayed 'close' may reflect an older session rather than yesterday's close; use bid/ask/last for limit pricing."
+            )
+
         return {
             "symbol": symbol.strip().upper(),
             "exchange": exchange,
@@ -425,6 +440,9 @@ class IBKRExecutionAdapter:
             "last": last if last > 0 else None,
             "close": close if close > 0 else None,
             "vwap": vwap if vwap > 0 else None,
+            "market_data_type": market_data_type,
+            "is_delayed": is_delayed,
+            "quote_notes": quote_notes,
             "as_of": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -452,15 +470,17 @@ class IBKRExecutionAdapter:
             }
         if state is None:
             return {"available": False, "reason": "IBKR whatIfOrder returned empty state (likely READ_ONLY_API=yes)"}
+        commission = _safe_float(getattr(state, "commission", None), 0.0) or None
+        raw_ccy = str(getattr(state, "commissionCurrency", "") or "").strip()
         return {
             "available": True,
             "init_margin_change": getattr(state, "initMarginChange", None),
             "maint_margin_change": getattr(state, "maintMarginChange", None),
             "equity_with_loan_after": getattr(state, "equityWithLoanAfter", None),
-            "commission": _safe_float(getattr(state, "commission", None), 0.0) or None,
+            "commission": commission,
             "min_commission": _safe_float(getattr(state, "minCommission", None), 0.0) or None,
             "max_commission": _safe_float(getattr(state, "maxCommission", None), 0.0) or None,
-            "commission_currency": getattr(state, "commissionCurrency", "USD"),
+            "commission_currency": raw_ccy or (None if commission is None else "USD"),
             "warning_text": getattr(state, "warningText", "") or "",
         }
 

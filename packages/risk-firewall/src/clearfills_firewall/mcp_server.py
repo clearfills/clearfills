@@ -171,7 +171,10 @@ CLOUD_TOOL_DEFINITIONS: list[dict[str, Any]] = TOOL_DEFINITIONS + [
             "type": "object",
             "properties": {
                 "entity": {"type": "string", "enum": ["all", "personal", "corporate", "holdco", "joint", "trust"], "default": "all"},
-                "usd_to_cad": {"type": "number", "default": 1.38},
+                "usd_to_cad": {
+                    "type": "number",
+                    "description": "Optional USD/CAD FX override. Omit to use live Bank of Canada FXUSDCAD rate.",
+                },
             },
         },
     },
@@ -298,8 +301,11 @@ def _handle_cloud_tool_call(
             return _tool_result(cloud.request("POST", "/api/v1/cloud/backtests", arguments))
         if tool_name == "get_net_worth":
             ent = str(arguments.get("entity", "all")).strip().lower()
-            fx = float(arguments.get("usd_to_cad", 1.38))
-            return _tool_result(cloud.request("GET", f"/api/v1/cloud/net-worth?entity={ent}&usd_to_cad={fx}"))
+            query = f"/api/v1/cloud/net-worth?entity={ent}"
+            if arguments.get("usd_to_cad") is not None:
+                fx = float(arguments["usd_to_cad"])
+                query += f"&usd_to_cad={fx}"
+            return _tool_result(cloud.request("GET", query))
         if tool_name == "sync_account_snapshot":
             return _tool_result(cloud.request("POST", "/api/v1/cloud/accounts/sync", arguments))
         return _tool_result({"error": f"Unknown tool: {tool_name}"}, is_error=True)
@@ -332,7 +338,7 @@ def handle_jsonrpc_request(
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "clearfills-trading-os" if cloud_client else "clearfills-risk-firewall",
-                    "version": "0.3.0",
+                    "version": "0.4.0",
                 },
             },
         )
