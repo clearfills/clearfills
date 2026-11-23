@@ -23,6 +23,48 @@ from .models import (
 )
 
 
+class SleevePolicy(BaseModel):
+    """Per-sleeve / asset-class risk override profile (e.g., cash_equivalent, core_index).
+
+    Fields left as None inherit the parent RiskPolicy default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(default_factory=list)
+    require_stop_loss: Optional[bool] = None
+    max_order_notional_usd: Optional[float] = Field(default=None, gt=0.0)
+    max_risk_per_trade_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    max_total_heat_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    max_gross_exposure_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
+    exempt_session_entry_cap: bool = Field(default=False)
+    exempt_last_session_of_week: bool = Field(default=False)
+    exempt_session_cutoff: bool = Field(default=False)
+    allow_shorting: Optional[bool] = None
+
+
+def default_allocation_sleeves() -> dict[str, SleevePolicy]:
+    """Institutional preset sleeves for T-bill cash parking and core index ETFs."""
+    return {
+        "cash_equivalent": SleevePolicy(
+            symbols=["SGOV", "BIL", "CBIL", "SHV", "USFR", "TFLO"],
+            require_stop_loss=False,
+            max_order_notional_usd=500_000.0,
+            exempt_session_entry_cap=True,
+            exempt_last_session_of_week=True,
+            exempt_session_cutoff=True,
+        ),
+        "core_index": SleevePolicy(
+            symbols=["VT", "VTI", "VOO", "SPY", "QQQ", "VEQT", "VBAL", "XEQT", "VXUS", "BND"],
+            require_stop_loss=False,
+            max_order_notional_usd=500_000.0,
+            exempt_session_entry_cap=True,
+            exempt_last_session_of_week=True,
+            exempt_session_cutoff=True,
+        ),
+    }
+
+
 class RiskPolicy(BaseModel):
     """Deterministic pre-trade risk policy loaded from YAML or code."""
 
@@ -47,6 +89,15 @@ class RiskPolicy(BaseModel):
     block_last_session_of_week: bool = Field(default=False)
     no_entries_after_et: Optional[str] = Field(default=None)
     max_gross_exposure_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
+    sleeves: dict[str, SleevePolicy] = Field(default_factory=dict)
+
+    def resolve_sleeve(self, symbol: str) -> tuple[str, Optional[SleevePolicy]]:
+        """Return (sleeve_name, SleevePolicy) matching symbol, or ('active_trading', None)."""
+        sym = symbol.strip().upper()
+        for name, sleeve in self.sleeves.items():
+            if sym in {s.strip().upper() for s in sleeve.symbols}:
+                return name, sleeve
+        return "active_trading", None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "RiskPolicy":
@@ -84,10 +135,46 @@ def evaluate_proposal(
     Accumulates all violations with exact reason codes so callers and auditors receive
     complete diagnostic visibility. Never relies on LLM judgement.
     """
+    sleeve_name, sleeve = policy.resolve_sleeve(proposal.symbol)
+    eff_require_stop = (
+        sleeve.require_stop_loss
+        if (sleeve is not None and sleeve.require_stop_loss is not None)
+        else policy.require_stop_loss
+    )
+    eff_max_notional = (
+        sleeve.max_order_notional_usd
+        if (sleeve is not None and sleeve.max_order_notional_usd is not None)
+        else policy.max_order_notional_usd
+    )
+    eff_max_risk_pct = (
+        sleeve.max_risk_per_trade_pct
+        if (sleeve is not None and sleeve.max_risk_per_trade_pct is not None)
+        else policy.max_risk_per_trade_pct
+    )
+    eff_max_heat_pct = (
+        sleeve.max_total_heat_pct
+        if (sleeve is not None and sleeve.max_total_heat_pct is not None)
+        else policy.max_total_heat_pct
+    )
+    eff_max_gross_pct = (
+        sleeve.max_gross_exposure_pct
+        if (sleeve is not None and sleeve.max_gross_exposure_pct is not None)
+        else policy.max_gross_exposure_pct
+    )
+    eff_allow_shorting = (
+        sleeve.allow_shorting
+        if (sleeve is not None and sleeve.allow_shorting is not None)
+        else policy.allow_shorting
+    )
+    exempt_entry_cap = bool(sleeve is not None and sleeve.exempt_session_entry_cap)
+    exempt_last_session = bool(sleeve is not None and sleeve.exempt_last_session_of_week)
+    exempt_cutoff = bool(sleeve is not None and sleeve.exempt_session_cutoff)
+
     reason_codes: list[str] = []
     reasons: list[str] = []
     metrics: dict[str, Any] = {
         "policy_version": policy.policy_version,
+        "sleeve": sleeve_name,
         "nav_usd": portfolio.nav_usd,
         "cash_usd": portfolio.cash_usd,
         "open_position_count": portfolio.open_position_count,
@@ -129,7 +216,7 @@ def evaluate_proposal(
     # 4. Shorting check
     held_qty = portfolio.held_quantity(proposal.symbol)
     is_reducing_position = proposal.side == Side.SELL and held_qty >= proposal.quantity
-    if proposal.side == Side.SELL and not policy.allow_shorting and held_qty < proposal.quantity:
+    if proposal.side == Side.SELL and not eff_allow_shorting and held_qty < proposal.quantity:
         add_veto(
             "SHORTING_NOT_ALLOWED",
             f"SELL quantity {proposal.quantity} exceeds held long quantity {held_qty} and allow_shorting=False",
@@ -152,7 +239,8 @@ def evaluate_proposal(
     # 6b. Session entry caps & calendar/time-of-day cutoffs (never block closing/reducing orders)
     if not is_reducing_position:
         if (
-            policy.max_entries_per_session is not None
+            not exempt_entry_cap
+            and policy.max_entries_per_session is not None
             and portfolio.session_entries >= policy.max_entries_per_session
         ):
             add_veto(
@@ -161,13 +249,13 @@ def evaluate_proposal(
             )
 
         eval_et = proposal.created_at.astimezone(_ET)
-        if policy.block_last_session_of_week and eval_et.weekday() == 4:
+        if not exempt_last_session and policy.block_last_session_of_week and eval_et.weekday() == 4:
             add_veto(
                 "LAST_SESSION_OF_WEEK_BLOCKED",
                 "Policy blocks new entries on the last session of the week (Friday ET)",
             )
 
-        if policy.no_entries_after_et:
+        if not exempt_cutoff and policy.no_entries_after_et:
             try:
                 cutoff_h, cutoff_m = (int(x) for x in policy.no_entries_after_et.strip().split(":", 1))
                 if (eval_et.hour, eval_et.minute) >= (cutoff_h, cutoff_m):
@@ -191,20 +279,20 @@ def evaluate_proposal(
         metrics["order_notional_usd"] = round(order_notional_usd, 4)
 
         # 8. Max order notional cap
-        if order_notional_usd > policy.max_order_notional_usd:
+        if order_notional_usd > eff_max_notional:
             add_veto(
                 "MAX_ORDER_NOTIONAL_EXCEEDED",
-                f"Order notional ${order_notional_usd:,.2f} exceeds max_order_notional_usd ${policy.max_order_notional_usd:,.2f}",
+                f"Order notional ${order_notional_usd:,.2f} exceeds max_order_notional_usd ${eff_max_notional:,.2f} (sleeve={sleeve_name})",
             )
 
         # 8b. Max gross exposure cap (for new/expanding positions)
-        if policy.max_gross_exposure_pct is not None and not is_reducing_position:
+        if eff_max_gross_pct is not None and not is_reducing_position:
             projected_gross_pct = ((portfolio.gross_exposure_usd + order_notional_usd) / portfolio.nav_usd) * 100.0
             metrics["projected_gross_exposure_pct"] = round(projected_gross_pct, 4)
-            if projected_gross_pct > policy.max_gross_exposure_pct:
+            if projected_gross_pct > eff_max_gross_pct:
                 add_veto(
                     "MAX_GROSS_EXPOSURE_EXCEEDED",
-                    f"Projected gross exposure {projected_gross_pct:.2f}% exceeds max_gross_exposure_pct {policy.max_gross_exposure_pct:.2f}%",
+                    f"Projected gross exposure {projected_gross_pct:.2f}% exceeds max_gross_exposure_pct {eff_max_gross_pct:.2f}% (sleeve={sleeve_name})",
                 )
 
         # 9. Stop-loss validation & stop-distance risk computation
@@ -224,10 +312,10 @@ def evaluate_proposal(
                 )
             else:
                 stop_distance = abs(entry_price - proposal.stop_price)
-        elif policy.require_stop_loss and not is_pm and not is_reducing_position:
+        elif eff_require_stop and not is_pm and not is_reducing_position:
             add_veto(
                 "MISSING_STOP_LOSS",
-                "Policy requires a protective stop_price on all new non-prediction-market orders",
+                f"Policy requires a protective stop_price on all new non-prediction-market orders (sleeve={sleeve_name})",
             )
         elif is_pm:
             # Binary prediction market contracts have bounded downside = entry_price per contract (for BUY)
@@ -236,7 +324,7 @@ def evaluate_proposal(
         if stop_distance is not None and stop_distance > 0:
             trade_risk_usd = stop_distance * proposal.quantity
             trade_risk_pct = (trade_risk_usd / portfolio.nav_usd) * 100.0
-            max_risk_usd = portfolio.nav_usd * (policy.max_risk_per_trade_pct / 100.0)
+            max_risk_usd = portfolio.nav_usd * (eff_max_risk_pct / 100.0)
             max_qty_by_risk = max_risk_usd / stop_distance
             projected_heat_pct = portfolio.current_heat_pct + trade_risk_pct
 
@@ -247,17 +335,17 @@ def evaluate_proposal(
             metrics["projected_heat_pct"] = round(projected_heat_pct, 4)
 
             # 10. Per-trade risk cap
-            if trade_risk_pct > policy.max_risk_per_trade_pct:
+            if trade_risk_pct > eff_max_risk_pct:
                 add_veto(
                     "MAX_RISK_PER_TRADE_EXCEEDED",
-                    f"Trade risk {trade_risk_pct:.2f}% (${trade_risk_usd:,.2f}) exceeds max_risk_per_trade_pct {policy.max_risk_per_trade_pct:.2f}% (max qty {max_qty_by_risk:.2f})",
+                    f"Trade risk {trade_risk_pct:.2f}% (${trade_risk_usd:,.2f}) exceeds max_risk_per_trade_pct {eff_max_risk_pct:.2f}% (max qty {max_qty_by_risk:.2f})",
                 )
 
             # 11. Total portfolio heat cap
-            if projected_heat_pct > policy.max_total_heat_pct:
+            if projected_heat_pct > eff_max_heat_pct:
                 add_veto(
                     "MAX_TOTAL_HEAT_EXCEEDED",
-                    f"Projected portfolio heat {projected_heat_pct:.2f}% exceeds max_total_heat_pct {policy.max_total_heat_pct:.2f}%",
+                    f"Projected portfolio heat {projected_heat_pct:.2f}% exceeds max_total_heat_pct {eff_max_heat_pct:.2f}%",
                 )
 
             # 12. Fractional-Kelly sizing check when target_price is supplied

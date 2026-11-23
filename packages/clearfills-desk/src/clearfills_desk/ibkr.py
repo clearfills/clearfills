@@ -21,15 +21,42 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from clearfills_firewall import OrderType, Side, SignedAttestation, TradeProposal
+from clearfills_firewall import (
+    OrderType,
+    PortfolioSnapshot,
+    Position,
+    Side,
+    SignedAttestation,
+    TradeProposal,
+)
 
 from .runtime import DeskRuntime, IBKRConnectionConfig
 
 PAPER_PORTS: frozenset[int] = frozenset({4002, 7497})
+PAPER_TAILNET_PORTS: frozenset[int] = frozenset({4002, 4004, 7497})
 LIVE_PORTS: frozenset[int] = frozenset({4001, 7496})
 PAPER_PREFIX = "DU"
 LIVE_ENV_FLAG = "CLEARFILLS_ALLOW_LIVE"
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_STOP_ORDER_TYPES: frozenset[str] = frozenset({"STP", "STP LMT", "TRAIL", "TRAIL LIMIT"})
+
+
+def mask_account_id(account_id: str) -> str:
+    """Mask an IBKR account ID to its last 3 characters for safe telemetry/logs."""
+    cleaned = account_id.strip()
+    if len(cleaned) <= 3:
+        return "***"
+    return f"***{cleaned[-3:]}"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        num = float(value)
+        if num != num:  # NaN check
+            return default
+        return num
+    except (TypeError, ValueError):
+        return default
 
 
 def _is_allowed_host(host: str, *, allow_tailnet_relay: bool = False) -> bool:
@@ -94,9 +121,10 @@ def validate_ibkr_connection(
         )
 
     if execution_mode == "paper":
-        if cfg.port not in PAPER_PORTS:
+        allowed_paper_ports = PAPER_TAILNET_PORTS if cfg.allow_tailnet_relay else PAPER_PORTS
+        if cfg.port not in allowed_paper_ports:
             raise LiveExecutionSafetyError(
-                f"Paper mode refuses port {cfg.port}; allowed paper ports: {sorted(PAPER_PORTS)}."
+                f"Paper mode refuses port {cfg.port}; allowed paper ports: {sorted(allowed_paper_ports)}."
             )
         if cfg.account_id and not cfg.account_id.startswith(PAPER_PREFIX):
             raise LiveExecutionSafetyError(
@@ -204,18 +232,252 @@ class IBKRExecutionAdapter:
         self._ib = IB()
         return self._ib
 
-    def connect(self) -> str:
+    def connect(self, *, readonly: bool = False) -> str:
         """Connect to IBKR Gateway/TWS and verify the active account matches mode."""
         cfg = self.runtime.config.ibkr
         validate_ibkr_connection(cfg, self._mode, env=self._env)
         ib = self._get_client()
         if not ib.isConnected():
-            ib.connect(cfg.host, cfg.port, clientId=cfg.client_id, readonly=False)
+            ib.connect(cfg.host, cfg.port, clientId=cfg.client_id, readonly=readonly)
         return verify_connected_accounts(ib.managedAccounts(), cfg.account_id, self._mode)
 
     def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():
             self._ib.disconnect()
+
+    def _build_stock_contract(self, symbol: str, *, exchange: str = "SMART", currency: str = "USD") -> Any:
+        try:
+            from ib_async import Stock  # type: ignore[import-not-found]
+            return Stock(symbol.strip().upper(), exchange, currency)
+        except ImportError:
+            return {"symbol": symbol.strip().upper(), "exchange": exchange, "currency": currency}
+
+    def list_open_orders(self) -> list[dict[str, Any]]:
+        """List open orders sanitized of raw account IDs."""
+        self.connect(readonly=True)
+        ib = self._get_client()
+        open_trades = getattr(ib, "openTrades", lambda: [])()
+        results: list[dict[str, Any]] = []
+        for tr in open_trades:
+            order = getattr(tr, "order", None)
+            contract = getattr(tr, "contract", None)
+            status_obj = getattr(tr, "orderStatus", None)
+            order_type = str(getattr(order, "orderType", "") or "").upper()
+            order_ref = str(getattr(order, "orderRef", "") or "")
+            is_stop = order_type in _STOP_ORDER_TYPES or order_ref.startswith("clearfills:stop:")
+            results.append(
+                {
+                    "order_id": int(getattr(order, "orderId", 0) or 0),
+                    "parent_id": int(getattr(order, "parentId", 0) or 0),
+                    "symbol": str(getattr(contract, "symbol", "") or "").upper(),
+                    "action": str(getattr(order, "action", "") or "").upper(),
+                    "order_type": order_type,
+                    "quantity": _safe_float(getattr(order, "totalQuantity", 0.0)),
+                    "limit_price": _safe_float(getattr(order, "lmtPrice", 0.0)) or None,
+                    "aux_price": _safe_float(getattr(order, "auxPrice", 0.0)) or None,
+                    "tif": str(getattr(order, "tif", "") or ""),
+                    "status": str(getattr(status_obj, "status", "Unknown") or "Unknown"),
+                    "order_ref": order_ref,
+                    "is_protective_stop": is_stop,
+                }
+            )
+        return results
+
+    def get_portfolio(self) -> dict[str, Any]:
+        """Fetch live NAV, settled USD/CAD cash, buying power, positions, and open orders (sanitized)."""
+        account = self.connect(readonly=True)
+        ib = self._get_client()
+
+        summary_rows = getattr(ib, "accountSummary", lambda _acct="": [])(account)
+        if not summary_rows and hasattr(ib, "accountValues"):
+            summary_rows = ib.accountValues(account)
+
+        nav_usd = 0.0
+        buying_power_usd = 0.0
+        daily_pnl_usd = 0.0
+        cash_by_currency: dict[str, float] = {}
+        settled_by_currency: dict[str, float] = {}
+
+        for row in summary_rows:
+            tag = str(getattr(row, "tag", "") or "")
+            ccy = str(getattr(row, "currency", "") or "").upper()
+            val = _safe_float(getattr(row, "value", 0.0))
+            if tag == "NetLiquidation" and ccy in {"USD", "BASE", ""}:
+                nav_usd = val
+            elif tag == "BuyingPower" and ccy in {"USD", "BASE", ""}:
+                buying_power_usd = val
+            elif tag in {"RealizedPnL", "DailyPnL"} and ccy in {"USD", "BASE", ""}:
+                daily_pnl_usd = val
+            elif tag == "TotalCashBalance" and ccy and ccy != "BASE":
+                cash_by_currency[ccy] = val
+            elif tag == "SettledCash" and ccy and ccy != "BASE":
+                settled_by_currency[ccy] = val
+            elif tag == "TotalCashValue" and ccy in {"USD", "CAD"} and ccy not in cash_by_currency:
+                cash_by_currency[ccy] = val
+
+        settled_usd = settled_by_currency.get("USD", cash_by_currency.get("USD", 0.0))
+        settled_cad = settled_by_currency.get("CAD", cash_by_currency.get("CAD", 0.0))
+
+        raw_positions = getattr(ib, "portfolio", lambda _acct="": [])(account)
+        if not raw_positions and hasattr(ib, "positions"):
+            raw_positions = ib.positions(account)
+
+        positions: list[dict[str, Any]] = []
+        for item in raw_positions:
+            contract = getattr(item, "contract", None)
+            sym = str(getattr(contract, "symbol", "") or "").upper()
+            qty = _safe_float(getattr(item, "position", 0.0))
+            if not sym or qty == 0.0:
+                continue
+            avg_cost = _safe_float(getattr(item, "averageCost", getattr(item, "avgCost", 0.0)))
+            mkt_price = _safe_float(getattr(item, "marketPrice", avg_cost), avg_cost)
+            mkt_val = _safe_float(getattr(item, "marketValue", qty * mkt_price), qty * mkt_price)
+            unrealized = _safe_float(getattr(item, "unrealizedPNL", 0.0))
+            ccy = str(getattr(contract, "currency", "USD") or "USD").upper()
+            positions.append(
+                {
+                    "symbol": sym,
+                    "quantity": qty,
+                    "avg_cost": round(avg_cost, 6),
+                    "market_price": round(mkt_price, 6),
+                    "market_value": round(mkt_val, 2),
+                    "unrealized_pnl": round(unrealized, 2),
+                    "currency": ccy,
+                }
+            )
+
+        open_orders = self.list_open_orders()
+        return {
+            "execution_mode": self._mode,
+            "venue": "ibkr",
+            "account_masked": mask_account_id(account),
+            "nav_usd": round(nav_usd, 2),
+            "settled_cash_usd": round(settled_usd, 2),
+            "settled_cash_cad": round(settled_cad, 2),
+            "cash_by_currency": {k: round(v, 2) for k, v in sorted(cash_by_currency.items())},
+            "buying_power_usd": round(buying_power_usd, 2),
+            "daily_pnl_usd": round(daily_pnl_usd, 2),
+            "positions": positions,
+            "open_orders": open_orders,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def build_portfolio_snapshot(self, portfolio_data: dict[str, Any] | None = None) -> PortfolioSnapshot:
+        """Convert sanitized `get_portfolio()` output into a `PortfolioSnapshot` for firewall evaluation."""
+        data = portfolio_data if portfolio_data is not None else self.get_portfolio()
+        open_positions = [
+            Position(
+                symbol=str(p["symbol"]).upper(),
+                quantity=float(p["quantity"]),
+                avg_entry_price=max(0.0001, float(p.get("avg_cost") or p.get("market_price") or 1.0)),
+                current_price=max(0.0001, float(p.get("market_price") or p.get("avg_cost") or 1.0)),
+                venue="ibkr",
+            )
+            for p in data.get("positions", [])
+            if float(p.get("quantity", 0.0)) > 0
+        ]
+        nav = max(1.0, float(data.get("nav_usd") or 1.0))
+        cash = max(0.0, float(data.get("settled_cash_usd") or 0.0))
+        return PortfolioSnapshot(
+            account_id=str(data.get("account_masked") or "***"),
+            nav_usd=nav,
+            cash_usd=cash,
+            daily_pnl_usd=float(data.get("daily_pnl_usd") or 0.0),
+            open_positions=open_positions,
+        )
+
+    def get_quote(self, symbol: str, *, exchange: str = "SMART", currency: str = "USD") -> dict[str, Any]:
+        """Fetch live snapshot bid/ask/last/VWAP quote from IBKR Gateway."""
+        self.connect(readonly=True)
+        ib = self._get_client()
+        contract = self._build_stock_contract(symbol, exchange=exchange, currency=currency)
+        qualified = ib.qualifyContracts(contract)
+        if qualified:
+            contract = qualified[0]
+
+        ticker = None
+        if hasattr(ib, "reqTickers"):
+            tickers = ib.reqTickers(contract)
+            ticker = tickers[0] if tickers else None
+        elif hasattr(ib, "reqMktData"):
+            ticker = ib.reqMktData(contract, "", snapshot=True)
+
+        bid = _safe_float(getattr(ticker, "bid", None), 0.0) if ticker is not None else 0.0
+        ask = _safe_float(getattr(ticker, "ask", None), 0.0) if ticker is not None else 0.0
+        last = _safe_float(getattr(ticker, "last", None), 0.0) if ticker is not None else 0.0
+        close = _safe_float(getattr(ticker, "close", None), 0.0) if ticker is not None else 0.0
+        vwap = _safe_float(getattr(ticker, "vwap", None), 0.0) if ticker is not None else 0.0
+        return {
+            "symbol": symbol.strip().upper(),
+            "exchange": exchange,
+            "currency": currency,
+            "bid": bid if bid > 0 else None,
+            "ask": ask if ask > 0 else None,
+            "last": last if last > 0 else None,
+            "close": close if close > 0 else None,
+            "vwap": vwap if vwap > 0 else None,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def what_if_order(self, proposal: TradeProposal) -> dict[str, Any]:
+        """Run IBKR `whatIfOrder` margin & commission preview without transmitting an order."""
+        account = self.connect(readonly=True)
+        ib = self._get_client()
+        contract, orders = self._build_contract_and_orders(
+            proposal=proposal,
+            account=account,
+            attestation_id="whatif-preview",
+        )
+        qualified = ib.qualifyContracts(contract)
+        if qualified:
+            contract = qualified[0]
+        parent = orders[0]
+        if not hasattr(ib, "whatIfOrder"):
+            return {"available": False, "reason": "IB client does not expose whatIfOrder"}
+        state = ib.whatIfOrder(contract, parent)
+        return {
+            "available": True,
+            "init_margin_change": getattr(state, "initMarginChange", None),
+            "maint_margin_change": getattr(state, "maintMarginChange", None),
+            "equity_with_loan_after": getattr(state, "equityWithLoanAfter", None),
+            "commission": _safe_float(getattr(state, "commission", None), 0.0) or None,
+            "min_commission": _safe_float(getattr(state, "minCommission", None), 0.0) or None,
+            "max_commission": _safe_float(getattr(state, "maxCommission", None), 0.0) or None,
+            "commission_currency": getattr(state, "commissionCurrency", "USD"),
+            "warning_text": getattr(state, "warningText", "") or "",
+        }
+
+    def cancel_order(self, order_id: int, *, force_cancel_stop: bool = False) -> dict[str, Any]:
+        """Cancel an open order while preserving protective stop-loss cancel guards."""
+        self.connect(readonly=False)
+        ib = self._get_client()
+        open_trades = getattr(ib, "openTrades", lambda: [])()
+        target_trade = None
+        for tr in open_trades:
+            if int(getattr(getattr(tr, "order", None), "orderId", -1)) == int(order_id):
+                target_trade = tr
+                break
+        if target_trade is None:
+            raise LiveExecutionSafetyError(f"Open order {order_id} not found.")
+
+        order = getattr(target_trade, "order", None)
+        contract = getattr(target_trade, "contract", None)
+        order_type = str(getattr(order, "orderType", "") or "").upper()
+        order_ref = str(getattr(order, "orderRef", "") or "")
+        is_stop = order_type in _STOP_ORDER_TYPES or order_ref.startswith("clearfills:stop:")
+        if is_stop and not force_cancel_stop:
+            raise LiveExecutionSafetyError(
+                f"Refusing to cancel protective stop-loss order {order_id} ({order_type}); pass force_cancel_stop=True only after flattening or replacing the stop."
+            )
+
+        ib.cancelOrder(order)
+        return {
+            "cancelled": True,
+            "order_id": int(order_id),
+            "symbol": str(getattr(contract, "symbol", "") or "").upper(),
+            "order_type": order_type,
+            "was_protective_stop": is_stop,
+        }
 
     def _build_contract_and_orders(
         self,

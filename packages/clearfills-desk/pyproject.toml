@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 clearfills-desk = "clearfills_desk.cli:main"
+clearfills-desk-mcp = "clearfills_desk.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/clearfills_desk"]

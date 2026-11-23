@@ -4,16 +4,21 @@ from .ibkr import (
     LIVE_ENV_FLAG,
     LIVE_PORTS,
     PAPER_PORTS,
+    PAPER_TAILNET_PORTS,
     ExecutionReceipt,
     IBKRExecutionAdapter,
     LiveExecutionSafetyError,
+    mask_account_id,
     validate_ibkr_connection,
     verify_connected_accounts,
 )
+from .mcp_server import BROKER_TOOL_DEFINITIONS, BrokerMCPServer, run_broker_stdio_server
 from .runtime import DESK_ROLES, DeskConfig, DeskRuntime, IBKRConnectionConfig
 from .telemetry import publish_arena_heartbeat, sanitize_text
 
 __all__ = [
+    "BROKER_TOOL_DEFINITIONS",
+    "BrokerMCPServer",
     "DESK_ROLES",
     "DeskConfig",
     "DeskRuntime",
@@ -24,7 +29,10 @@ __all__ = [
     "LIVE_PORTS",
     "LiveExecutionSafetyError",
     "PAPER_PORTS",
+    "PAPER_TAILNET_PORTS",
+    "mask_account_id",
     "publish_arena_heartbeat",
+    "run_broker_stdio_server",
     "sanitize_text",
     "validate_ibkr_connection",
     "verify_connected_accounts",

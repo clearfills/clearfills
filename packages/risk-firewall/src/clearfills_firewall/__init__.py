@@ -18,7 +18,7 @@ from .models import (
     TradeProposal,
     VenueType,
 )
-from .policy import RiskPolicy, evaluate_proposal
+from .policy import RiskPolicy, SleevePolicy, default_allocation_sleeves, evaluate_proposal
 from .server import FirewallService, create_app
 
 __all__ = [
@@ -38,10 +38,12 @@ __all__ = [
     "RiskPolicy",
     "Side",
     "SignedAttestation",
+    "SleevePolicy",
     "TradeProposal",
     "VenueType",
     "canonical_order_hash",
     "create_app",
+    "default_allocation_sleeves",
     "evaluate_proposal",
     "from_ai_hedge_fund_signal",
     "from_tradingagents_decision",

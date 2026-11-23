@@ -47,6 +47,7 @@ class DeskConfig(BaseModel):
     desk_name: str = Field(..., min_length=1, max_length=120)
     execution_mode: Literal["paper", "live", "shadow", "enforce"] = "paper"
     venue: str = "ibkr"
+    human_confirm_above_usd: float = Field(default=25_000.0, ge=0.0)
     ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
     risk: RiskPolicy = Field(default_factory=RiskPolicy)
 
