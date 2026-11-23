@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from .sync import (
     sync_openadapt_snapshot_to_cloud,
 )
 from .telemetry import sanitize_text
+from .worker import ApprovalWorker, DEFAULT_CLOUD_API_URL
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,10 +56,48 @@ def main(argv: list[str] | None = None) -> int:
     p_sync.add_argument("--name", default="Account", help="Human account label.")
     p_sync.add_argument("--entity", default="personal", choices=["personal", "corporate", "holdco", "joint", "trust"])
 
+    p_watch = sub.add_parser(
+        "watch",
+        help="Poll ClearFills Cloud for 1-Tap approved IBKR orders and execute with fresh Ed25519 attestations.",
+    )
+    p_watch.add_argument("--config", required=True, type=Path, help="Path to desk_rules YAML file.")
+    p_watch.add_argument("--state-dir", type=Path, default=Path(".clearfills_state"))
+    p_watch.add_argument("--interval", type=float, default=3.0, help="Poll interval in seconds (default: 3.0).")
+    p_watch.add_argument(
+        "--max-slippage-bps",
+        type=float,
+        default=50.0,
+        help="Maximum allowed deviation in basis points from approved limit_price (default: 50.0).",
+    )
+    p_watch.add_argument("--once", action="store_true", help="Run a single poll cycle and exit.")
+    p_watch.add_argument("--dry-run", action="store_true", help="Validate quotes & mint attestations without submitting orders.")
+
     args = parser.parse_args(argv)
 
+    if args.command == "watch":
+        api_key = os.environ.get("CLEARFILLS_API_KEY", "").strip()
+        if not api_key:
+            print(json.dumps({"error": "CLEARFILLS_API_KEY environment variable is required"}))
+            return 2
+        api_url = (os.environ.get("CLEARFILLS_API_URL", DEFAULT_CLOUD_API_URL) or DEFAULT_CLOUD_API_URL).strip()
+        cfg = DeskConfig.from_yaml(args.config)
+        rt = DeskRuntime(cfg, state_dir=args.state_dir)
+        adapter = IBKRExecutionAdapter(rt)
+        worker = ApprovalWorker(
+            adapter=adapter,
+            api_key=api_key,
+            api_url=api_url,
+            max_slippage_bps=args.max_slippage_bps,
+            dry_run=args.dry_run,
+        )
+        if args.once:
+            results = worker.poll_once()
+            print(json.dumps(results, indent=2, default=str))
+            return 0
+        worker.run_forever(poll_interval_sec=args.interval)
+        return 0
+
     if args.command == "sync":
-        import os
         api_key = (args.api_key or os.environ.get("CLEARFILLS_API_KEY", "")).strip()
         if not api_key:
             print(json.dumps({"error": "CLEARFILLS_API_KEY or --api-key is required"}))

@@ -15,10 +15,13 @@ from .ibkr import (
 from .mcp_server import BROKER_TOOL_DEFINITIONS, BrokerMCPServer, run_broker_stdio_server
 from .runtime import DESK_ROLES, DeskConfig, DeskRuntime, IBKRConnectionConfig
 from .telemetry import publish_arena_heartbeat, sanitize_text
+from .worker import ApprovalWorker, CloudHTTPError
 
 __all__ = [
+    "ApprovalWorker",
     "BROKER_TOOL_DEFINITIONS",
     "BrokerMCPServer",
+    "CloudHTTPError",
     "DESK_ROLES",
     "DeskConfig",
     "DeskRuntime",
