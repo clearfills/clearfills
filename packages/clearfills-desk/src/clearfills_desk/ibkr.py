@@ -396,6 +396,11 @@ class IBKRExecutionAdapter:
             contract = qualified[0]
 
         ticker = None
+        if hasattr(ib, "reqMarketDataType"):
+            try:
+                ib.reqMarketDataType(3)  # Live if subscribed, delayed fallback otherwise
+            except Exception:
+                pass
         if hasattr(ib, "reqTickers"):
             tickers = ib.reqTickers(contract)
             ticker = tickers[0] if tickers else None
@@ -434,7 +439,15 @@ class IBKRExecutionAdapter:
         parent = orders[0]
         if not hasattr(ib, "whatIfOrder"):
             return {"available": False, "reason": "IB client does not expose whatIfOrder"}
-        state = ib.whatIfOrder(contract, parent)
+        try:
+            state = ib.whatIfOrder(contract, parent)
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"IBKR whatIfOrder unavailable ({type(exc).__name__}: {exc or 'timed out — check READ_ONLY_API setting'})",
+            }
+        if state is None:
+            return {"available": False, "reason": "IBKR whatIfOrder returned empty state (likely READ_ONLY_API=yes)"}
         return {
             "available": True,
             "init_margin_change": getattr(state, "initMarginChange", None),

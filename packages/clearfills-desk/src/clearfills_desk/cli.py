@@ -9,8 +9,15 @@ from pathlib import Path
 
 from clearfills_firewall import OrderType, PortfolioSnapshot, Side, TradeProposal
 
-from .ibkr import LiveExecutionSafetyError, validate_ibkr_connection
+from .ibkr import IBKRExecutionAdapter, LiveExecutionSafetyError, validate_ibkr_connection
 from .runtime import DeskConfig, DeskRuntime
+from .sync import (
+    DEFAULT_API_BASE,
+    fetch_evm_wallet_snapshot,
+    post_account_snapshot,
+    sync_ibkr_to_cloud,
+    sync_openadapt_snapshot_to_cloud,
+)
 from .telemetry import sanitize_text
 
 
@@ -35,7 +42,53 @@ def main(argv: list[str] | None = None) -> int:
     p_chk.add_argument("--nav", type=float, default=100_000.0)
     p_chk.add_argument("--session-entries", type=int, default=0)
 
+    p_sync = sub.add_parser("sync", help="Sync IBKR, MetaMask/EVM, or OpenAdapt local snapshots to ClearFills Cloud.")
+    p_sync.add_argument("source", choices=["ibkr", "evm", "file"])
+    p_sync.add_argument("--api-key", default=None, help="ClearFills Cloud API key (or CLEARFILLS_API_KEY env).")
+    p_sync.add_argument("--api-base", default=DEFAULT_API_BASE)
+    p_sync.add_argument("--config", type=Path, default=None, help="DeskConfig YAML (for source=ibkr).")
+    p_sync.add_argument("--state-dir", type=Path, default=Path(".clearfills_state"))
+    p_sync.add_argument("--address", default=None, help="Public 0x EVM/MetaMask address (for source=evm).")
+    p_sync.add_argument("--chain", default="ethereum", help="EVM chain (ethereum, base, arbitrum).")
+    p_sync.add_argument("--input", type=Path, default=None, help="Local JSON snapshot path (for source=file).")
+    p_sync.add_argument("--name", default="Account", help="Human account label.")
+    p_sync.add_argument("--entity", default="personal", choices=["personal", "corporate", "holdco", "joint", "trust"])
+
     args = parser.parse_args(argv)
+
+    if args.command == "sync":
+        import os
+        api_key = (args.api_key or os.environ.get("CLEARFILLS_API_KEY", "")).strip()
+        if not api_key:
+            print(json.dumps({"error": "CLEARFILLS_API_KEY or --api-key is required"}))
+            return 2
+        if args.source == "ibkr":
+            if not args.config:
+                print(json.dumps({"error": "--config is required for sync ibkr"}))
+                return 2
+            cfg = DeskConfig.from_yaml(args.config)
+            rt = DeskRuntime(cfg, state_dir=args.state_dir)
+            adapter = IBKRExecutionAdapter(rt)
+            res = sync_ibkr_to_cloud(adapter, api_key=api_key, api_base=args.api_base, account_name=args.name, entity=args.entity)
+            print(json.dumps(res, indent=2))
+            return 0
+        if args.source == "evm":
+            if not args.address:
+                print(json.dumps({"error": "--address is required for sync evm"}))
+                return 2
+            snap = fetch_evm_wallet_snapshot(args.address, chain=args.chain, account_name=args.name, entity=args.entity)
+            res = post_account_snapshot(snap, api_key=api_key, api_base=args.api_base)
+            print(json.dumps(res, indent=2))
+            return 0
+        if args.source == "file":
+            if not args.input:
+                print(json.dumps({"error": "--input is required for sync file"}))
+                return 2
+            res = sync_openadapt_snapshot_to_cloud(args.input, api_key=api_key, api_base=args.api_base)
+            print(json.dumps(res, indent=2))
+            return 0
+        return 1
+
     cfg = DeskConfig.from_yaml(args.config)
 
     if args.command == "validate":
