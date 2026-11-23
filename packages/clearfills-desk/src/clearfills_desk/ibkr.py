@@ -233,12 +233,35 @@ class IBKRExecutionAdapter:
         return self._ib
 
     def connect(self, *, readonly: bool = False) -> str:
-        """Connect to IBKR Gateway/TWS and verify the active account matches mode."""
+        """Connect to IBKR Gateway/TWS and verify the active account matches mode.
+
+        If the configured `client_id` is already held by another local agent session
+        (IBKR Error 326 / peer closed), automatically retries up to 5 incremental IDs
+        so Claude Code, Codex, and CLI commands can coexist cleanly.
+        """
         cfg = self.runtime.config.ibkr
         validate_ibkr_connection(cfg, self._mode, env=self._env)
         ib = self._get_client()
         if not ib.isConnected():
-            ib.connect(cfg.host, cfg.port, clientId=cfg.client_id, readonly=readonly)
+            last_exc: Exception | None = None
+            base_id = int(cfg.client_id)
+            for offset in range(6):
+                cid = base_id + offset
+                try:
+                    ib.connect(cfg.host, cfg.port, clientId=cid, readonly=readonly, timeout=4.0)
+                    last_exc = None
+                    break
+                except TypeError:
+                    # Test doubles / older clients without timeout kwarg
+                    ib.connect(cfg.host, cfg.port, clientId=cid, readonly=readonly)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if isinstance(exc, ConnectionRefusedError):
+                        raise
+            if last_exc is not None:
+                raise last_exc
         return verify_connected_accounts(ib.managedAccounts(), cfg.account_id, self._mode)
 
     def disconnect(self) -> None:
