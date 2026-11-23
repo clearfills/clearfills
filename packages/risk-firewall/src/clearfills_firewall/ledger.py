@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
+from ._locks import file_lock
 from .models import AuditEntry, utc_now
 
 GENESIS_HASH = "0" * 64
@@ -71,7 +72,7 @@ class AuditLedger:
         # Round-trip payload through JSON so hashes match deserialized values deterministically
         normalized_payload: dict[str, Any] = json.loads(json.dumps(payload, default=str))
 
-        with self._lock:
+        with self._lock, file_lock(self._path):
             seq, prev_hash = self._get_tail_state()
             next_seq = seq + 1
             entry_hash = _compute_entry_hash(

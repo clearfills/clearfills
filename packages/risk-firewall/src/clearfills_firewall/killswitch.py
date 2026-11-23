@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ._locks import file_lock
 from .models import utc_now
 
 
@@ -91,7 +92,7 @@ class KillSwitch:
         if not actor_clean:
             raise ValueError("trip() requires a non-empty actor")
 
-        with self._lock:
+        with self._lock, file_lock(self._path):
             current = self._read_fail_closed()
             history = list(current.history)
             now = utc_now()
@@ -123,7 +124,7 @@ class KillSwitch:
         if not approver_clean:
             raise ValueError("reset() requires an explicit non-empty approver")
 
-        with self._lock:
+        with self._lock, file_lock(self._path):
             current = self._read_fail_closed()
             history = list(current.history)
             now = utc_now()

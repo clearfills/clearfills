@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from ._locks import file_lock
 from .models import SignedAttestation, TradeProposal, utc_now
 
 
@@ -121,7 +124,20 @@ class AttestationAuthority:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        path.write_bytes(pem_bytes)
+        # Create atomically with 0600 permissions so the private key is never world/group-readable
+        with file_lock(path):
+            if not path.exists():
+                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, pem_bytes)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.chmod(path, 0o600)
+            else:
+                key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+                if not isinstance(key, Ed25519PrivateKey):
+                    raise TypeError(f"Expected Ed25519 private key in {path}")
         return cls(private_key=key, ttl_seconds=ttl_seconds, spent_nonces_path=spent_nonces_path)
 
     @property
@@ -221,8 +237,10 @@ class AttestationAuthority:
         if check_time < attestation.issued_at.astimezone(timezone.utc) - timedelta(seconds=5):
             return False, "ATTESTATION_NOT_YET_VALID"
 
-        # 5. Atomic single-use nonce check & consumption (prevents replay attacks)
-        with self._lock:
+        # 5. Atomic single-use nonce check & consumption (cross-process locked)
+        with self._lock, file_lock(self._spent_nonces_path):
+            if self._spent_nonces_path is not None:
+                self._spent_nonces |= self._load_spent_nonces()
             if attestation.nonce in self._spent_nonces:
                 return False, "ATTESTATION_REPLAY_DETECTED"
             self._spent_nonces.add(attestation.nonce)
@@ -254,7 +272,15 @@ class AttestationAuthority:
         if self._spent_nonces_path is None:
             return
         self._spent_nonces_path.parent.mkdir(parents=True, exist_ok=True)
-        self._spent_nonces_path.write_text(
-            json.dumps(sorted(self._spent_nonces)),
-            encoding="utf-8",
-        )
+        payload = json.dumps(sorted(self._spent_nonces))
+        fd, tmp_name = tempfile.mkstemp(prefix=".nonces_", suffix=".tmp", dir=str(self._spent_nonces_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, self._spent_nonces_path)
+        except Exception:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+            raise
