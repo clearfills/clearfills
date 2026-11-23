@@ -27,13 +27,27 @@ DESK_ROLES: dict[str, str] = {
 }
 
 
+class IBKRConnectionConfig(BaseModel):
+    """IBKR TWS / IB Gateway connection settings with fail-closed paper/live separation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host: str = "127.0.0.1"
+    port: int = 4002  # 4002/7497 = Paper, 4001/7496 = Live
+    client_id: int = 17
+    account_id: str | None = None
+    allow_live: bool = False
+    allow_tailnet_relay: bool = False
+
+
 class DeskConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     desk_id: str = Field(..., min_length=1, max_length=64)
     desk_name: str = Field(..., min_length=1, max_length=120)
-    execution_mode: Literal["paper", "shadow", "enforce"] = "paper"
+    execution_mode: Literal["paper", "live", "shadow", "enforce"] = "paper"
     venue: str = "ibkr"
+    ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
     risk: RiskPolicy = Field(default_factory=RiskPolicy)
 
     @classmethod

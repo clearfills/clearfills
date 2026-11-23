@@ -1,0 +1,30 @@
+# ClearFills Desk OS — Live IBKR Execution Policy (Enforce Mode)
+# Requires TWO-KEY live opt-in:
+#   1. ibkr.allow_live: true (below) + explicit live account_id (e.g. U1234567) + live port 4001/7496
+#   2. Environment variable CLEARFILLS_ALLOW_LIVE=1
+
+desk_id: mldsai-live-sleeve
+desk_name: Live IBKR Desk (Capped Sleeve)
+execution_mode: live
+venue: ibkr
+
+ibkr:
+  host: 127.0.0.1
+  port: 4001          # IB Gateway Live (4001) or TWS Live (7496)
+  client_id: 21
+  account_id: U0000000  # Replace with your live IBKR account ID
+  allow_live: true
+
+risk:
+  max_risk_per_trade_pct: 1.0
+  max_open_positions: 10
+  max_total_heat_pct: 12.0
+  max_daily_loss_pct: 2.0
+  max_order_notional_usd: 25000.0
+  max_gross_exposure_pct: 100.0
+  max_entries_per_session: 4
+  no_entries_after_et: "15:30"
+  block_last_session_of_week: true
+  require_stop_loss: true
+  allow_shorting: false
+  enforce_kelly_sizing: false

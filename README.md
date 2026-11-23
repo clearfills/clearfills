@@ -32,6 +32,11 @@ Run the FastAPI HTTP firewall service:
 clearfills-firewall
 ```
 
+Validate a Paper or Live IBKR Desk config (`packages/clearfills-desk`):
+```bash
+CLEARFILLS_ALLOW_LIVE=1 clearfills-desk validate --config packages/clearfills-desk/config/desk_rules.live.example.yaml
+```
+
 ---
 
 ## Connect to Claude Code & Cursor

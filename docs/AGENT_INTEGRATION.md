@@ -50,3 +50,13 @@ When writing or modifying code that proposes or executes trades on IBKR, Alpaca,
 2. Never emit unguarded `MKT` orders or orders without protective stops / bounded binary collateral.
 3. Require `SignedAttestation` verification (`dispatch_check`) at the execution gateway boundary.
 ```
+
+---
+
+## 4. Live IBKR Two-Key Safety Guard (`clearfills-desk`)
+- Paper mode is restricted to loopback ports `4002`/`7497` and `DU*` accounts.
+- Live mode (`execution_mode: live`) is fail-closed unless **all** conditions hold:
+  1. Loopback host (`127.0.0.1`/`localhost`) or explicit `ibkr.allow_tailnet_relay: true` for a Tailscale relay.
+  2. Live port (`4001`/`7496`) and explicit non-`DU` live `account_id` verified against `managedAccounts()`.
+  3. Two-key opt-in: `ibkr.allow_live: true` in YAML **and** `CLEARFILLS_ALLOW_LIVE=1` in the environment.
+  4. Valid single-use Ed25519 `SignedAttestation` verified via `dispatch_check()` before any IBKR API call.
