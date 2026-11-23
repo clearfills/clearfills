@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clearfills-firewall"
+version = "0.1.0"
+description = "Deterministic Ed25519 pre-trade risk firewall & MCP server for AI trading agents (clearfills.com)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "ClearFills / MLDSAI Inc.", email = "desk@mldsai.com" },
+]
+keywords = [
+    "ai-trading",
+    "mcp",
+    "risk-firewall",
+    "ed25519",
+    "ibkr",
+    "alpaca",
+    "polymarket",
+    "kalshi",
+    "trading-agents",
+    "quant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "pydantic>=2.0.0",
+    "cryptography>=42.0.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://clearfills.com"
+Documentation = "https://clearfills.com/llms.txt"
+Repository = "https://github.com/clearfills/clearfills"
+Issues = "https://github.com/clearfills/clearfills/issues"
+
+[project.scripts]
+clearfills-firewall = "clearfills_firewall.server:main"
+clearfills-mcp = "clearfills_firewall.mcp_server:main"
+clearfills-firewall-mcp = "clearfills_firewall.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clearfills_firewall"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
