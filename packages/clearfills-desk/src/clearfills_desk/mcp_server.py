@@ -370,9 +370,9 @@ class BrokerMCPServer:
 
             return _tool_result({"error": f"Unknown tool: {tool_name}"}, is_error=True)
         except LiveExecutionSafetyError as exc:
-            return _tool_result({"error": "SAFETY_GUARD_BLOCKED", "detail": str(exc)}, is_error=True)
+            return _tool_result({"error": "SAFETY_GUARD_BLOCKED", "detail": str(exc) or type(exc).__name__}, is_error=True)
         except Exception as exc:
-            return _tool_result({"error": "BROKER_EXECUTION_ERROR", "detail": str(exc)}, is_error=True)
+            return _tool_result({"error": "BROKER_EXECUTION_ERROR", "detail": str(exc) or type(exc).__name__}, is_error=True)
 
 
 def run_broker_stdio_server(
