@@ -164,6 +164,41 @@ CLOUD_TOOL_DEFINITIONS: list[dict[str, Any]] = TOOL_DEFINITIONS + [
             "required": ["strategy_name", "daily_returns"],
         },
     },
+    {
+        "name": "get_net_worth",
+        "description": "Return unified multi-entity (personal, corporate, holdco) and multi-institution net worth across all synced accounts (IBKR, RBC, RBC Bank US, Questrade, Wealthsimple, MetaMask, TD, Scotia, CIBC, etc.) in USD and CAD.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "enum": ["all", "personal", "corporate", "holdco", "joint", "trust"], "default": "all"},
+                "usd_to_cad": {"type": "number", "default": 1.38},
+            },
+        },
+    },
+    {
+        "name": "sync_account_snapshot",
+        "description": "Upsert a sanitized account balance & holdings snapshot from IBKR, SnapTrade, EVM RPC, or a local OpenAdapt sync agent into your ClearFills Cloud net-worth ledger.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_key": {"type": "string"},
+                "institution": {"type": "string"},
+                "account_name": {"type": "string"},
+                "entity": {"type": "string", "enum": ["personal", "corporate", "holdco", "joint", "trust"]},
+                "entity_name": {"type": "string"},
+                "account_type": {"type": "string"},
+                "currency": {"type": "string", "default": "USD"},
+                "cash_balance": {"type": "number"},
+                "investments_value": {"type": "number"},
+                "liabilities_value": {"type": "number"},
+                "sync_source": {"type": "string"},
+                "capability": {"type": "string", "enum": ["read_only", "trade_attested", "transfer_attested"]},
+                "account_masked": {"type": "string"},
+                "holdings": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["account_key", "institution", "account_name"],
+        },
+    },
 ]
 
 
@@ -261,6 +296,12 @@ def _handle_cloud_tool_call(
             return _tool_result(cloud.request("GET", f"/api/v1/cloud/journal?limit={limit}"))
         if tool_name == "run_backtest":
             return _tool_result(cloud.request("POST", "/api/v1/cloud/backtests", arguments))
+        if tool_name == "get_net_worth":
+            ent = str(arguments.get("entity", "all")).strip().lower()
+            fx = float(arguments.get("usd_to_cad", 1.38))
+            return _tool_result(cloud.request("GET", f"/api/v1/cloud/net-worth?entity={ent}&usd_to_cad={fx}"))
+        if tool_name == "sync_account_snapshot":
+            return _tool_result(cloud.request("POST", "/api/v1/cloud/accounts/sync", arguments))
         return _tool_result({"error": f"Unknown tool: {tool_name}"}, is_error=True)
     except Exception as exc:
         return _tool_result({"error": "CLOUD_API_ERROR", "detail": str(exc)}, is_error=True)
