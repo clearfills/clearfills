@@ -17,9 +17,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional, TextIO
+from typing import Any, Callable, Optional, TextIO
 
 from pydantic import ValidationError
 
@@ -30,6 +33,7 @@ from .runtime import DeskConfig, DeskRuntime
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_CACHED_ATTESTATIONS = 256
+DEFAULT_CLOUD_API_URL = "https://clearfills-api.fly.dev"
 
 BROKER_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -100,6 +104,22 @@ BROKER_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "execute_approved_order",
+        "description": (
+            "Verify with ClearFills Cloud that approval_id has status=='approved' and matches the cached "
+            "attestation's symbol, side, and quantity. Fails closed with APPROVAL_NOT_GRANTED if not approved; "
+            "otherwise executes the attested order and reports the broker fill receipt to ClearFills Cloud."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "approval_id": {"type": "string", "description": "ClearFills Cloud approval_id."},
+                "attestation_id": {"type": "string", "description": "Single-use Ed25519 attestation_id from preview_order."},
+            },
+            "required": ["approval_id", "attestation_id"],
+        },
+    },
+    {
         "name": "list_open_orders",
         "description": "List all open IBKR orders (sanitized of raw account IDs, flagging protective stops).",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -150,18 +170,77 @@ def _tool_result(payload: Any, is_error: bool = False) -> dict[str, Any]:
 class BrokerMCPServer:
     """Stateful MCP handler bridging ClearFills Firewall and IBKRExecutionAdapter."""
 
-    def __init__(self, adapter: IBKRExecutionAdapter) -> None:
+    def __init__(
+        self,
+        adapter: IBKRExecutionAdapter,
+        *,
+        cloud_api_key: Optional[str] = None,
+        cloud_api_url: Optional[str] = None,
+        cloud_transport: Optional[Callable[[str, str, Optional[dict[str, Any]]], Any]] = None,
+    ) -> None:
         self.adapter = adapter
         self.runtime = adapter.runtime
-        self._attestation_cache: OrderedDict[str, tuple[SignedAttestation, float, dict[str, Any]]] = OrderedDict()
+        self._cloud_api_key = cloud_api_key
+        self._cloud_api_url = cloud_api_url
+        self._cloud_transport = cloud_transport
+        self._attestation_cache: OrderedDict[
+            str, tuple[SignedAttestation, float, dict[str, Any], TradeProposal]
+        ] = OrderedDict()
+
+    def _get_cloud_config(self) -> tuple[str, str]:
+        api_key = (
+            self._cloud_api_key
+            if self._cloud_api_key is not None
+            else os.environ.get("CLEARFILLS_API_KEY", "")
+        ).strip()
+        api_url = (
+            self._cloud_api_url
+            if self._cloud_api_url is not None
+            else os.environ.get("CLEARFILLS_API_URL", DEFAULT_CLOUD_API_URL)
+        ).strip() or DEFAULT_CLOUD_API_URL
+        return api_key, api_url.rstrip("/")
+
+    def _cloud_request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict[str, Any]] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> Any:
+        api_key, api_url = self._get_cloud_config()
+        if self._cloud_transport is not None:
+            return self._cloud_transport(method, path, body)
+        if not api_key:
+            raise RuntimeError("CLEARFILLS_API_KEY is not configured")
+        url = f"{api_url}{path}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        data = json.dumps(body, default=str).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
     def _cache_attestation(
         self,
         attestation: SignedAttestation,
         notional_usd: float,
         order_summary: dict[str, Any],
+        proposal: TradeProposal,
     ) -> None:
-        self._attestation_cache[attestation.attestation_id] = (attestation, notional_usd, order_summary)
+        self._attestation_cache[attestation.attestation_id] = (
+            attestation,
+            notional_usd,
+            order_summary,
+            proposal,
+        )
         self._attestation_cache.move_to_end(attestation.attestation_id)
         while len(self._attestation_cache) > _MAX_CACHED_ATTESTATIONS:
             self._attestation_cache.popitem(last=False)
@@ -271,23 +350,66 @@ class BrokerMCPServer:
                 what_if = self.adapter.what_if_order(proposal)
                 threshold = self.runtime.config.human_confirm_above_usd
                 requires_confirm = notional_usd >= threshold
-                self._cache_attestation(decision.attestation, notional_usd, summary)
+                self._cache_attestation(decision.attestation, notional_usd, summary, proposal)
 
-                return _tool_result(
-                    {
-                        "approved": True,
-                        "status": decision.status.value,
-                        "proposal_id": proposal.proposal_id,
+                preview_payload: dict[str, Any] = {
+                    "approved": True,
+                    "status": decision.status.value,
+                    "proposal_id": proposal.proposal_id,
+                    "attestation_id": decision.attestation.attestation_id,
+                    "expires_at": decision.attestation.expires_at.isoformat(),
+                    "order_hash": decision.attestation.order_hash,
+                    "metrics": decision.metrics,
+                    "what_if": what_if,
+                    "order_summary": summary,
+                    "requires_human_confirmation": requires_confirm,
+                    "human_confirm_above_usd": threshold,
+                }
+
+                api_key, api_url = self._get_cloud_config()
+                if requires_confirm and api_key:
+                    approval_req = {
                         "attestation_id": decision.attestation.attestation_id,
-                        "expires_at": decision.attestation.expires_at.isoformat(),
+                        "proposal_id": proposal.proposal_id,
+                        "symbol": proposal.symbol.upper(),
+                        "side": proposal.side.value,
+                        "order_type": proposal.order_type.value,
+                        "quantity": proposal.quantity,
+                        "limit_price": proposal.limit_price,
+                        "stop_price": proposal.stop_price,
+                        "target_price": proposal.target_price,
+                        "notional_usd": round(notional_usd, 2),
+                        "sleeve": sleeve,
+                        "agent_id": proposal.agent_id,
+                        "venue": proposal.venue,
+                        "execution_mode": self.adapter.execution_mode,
+                        "reasoning_trace": proposal.reasoning_trace,
                         "order_hash": decision.attestation.order_hash,
-                        "metrics": decision.metrics,
-                        "what_if": what_if,
+                        "expires_at": decision.attestation.expires_at.isoformat(),
                         "order_summary": summary,
-                        "requires_human_confirmation": requires_confirm,
-                        "human_confirm_above_usd": threshold,
+                        "what_if": what_if,
                     }
-                )
+                    try:
+                        cloud_resp = self._cloud_request(
+                            "POST",
+                            "/api/v1/cloud/approvals",
+                            approval_req,
+                            timeout=5.0,
+                        )
+                        if isinstance(cloud_resp, dict):
+                            approval_id = cloud_resp.get("approval_id") or cloud_resp.get("id")
+                            if approval_id:
+                                preview_payload["cloud_approval"] = {
+                                    "approval_id": str(approval_id),
+                                    "status": str(cloud_resp.get("status") or "pending"),
+                                    "approval_url": str(
+                                        cloud_resp.get("approval_url") or f"{api_url}/approvals/{approval_id}"
+                                    ),
+                                }
+                    except Exception:
+                        pass
+
+                return _tool_result(preview_payload)
 
             if tool_name == "execute_attested_order":
                 att_id = str(arguments.get("attestation_id", "")).strip()
@@ -311,7 +433,7 @@ class BrokerMCPServer:
                     sleeve, _ = self.runtime.config.risk.resolve_sleeve(proposal.symbol)
                     summary = self._build_order_summary(proposal, notional_usd, sleeve)
                 elif cached is not None:
-                    attestation, notional_usd, summary = cached
+                    attestation, notional_usd, summary, _cached_proposal = cached
                     prop_payload = dict(raw_proposal)
                     prop_payload.setdefault("proposal_id", attestation.proposal_id)
                     try:
@@ -347,6 +469,169 @@ class BrokerMCPServer:
                 receipt = self.adapter.submit_attested_order(proposal=proposal, attestation=attestation)
                 self._attestation_cache.pop(attestation.attestation_id, None)
                 return _tool_result(receipt.model_dump(mode="json"))
+
+            if tool_name == "execute_approved_order":
+                approval_id = str(arguments.get("approval_id", "")).strip()
+                att_id = str(arguments.get("attestation_id", "")).strip()
+                if not approval_id or not att_id:
+                    return _tool_result(
+                        {
+                            "error": "VALIDATION_ERROR",
+                            "detail": "Both approval_id and attestation_id are required.",
+                        },
+                        is_error=True,
+                    )
+
+                cached = self._attestation_cache.get(att_id)
+                if cached is None:
+                    return _tool_result(
+                        {
+                            "error": "UNKNOWN_ATTESTATION_ID",
+                            "detail": f"Attestation {att_id!r} not found in preview cache. Call preview_order first.",
+                        },
+                        is_error=True,
+                    )
+                _attestation, _notional_usd, _summary, cached_proposal = cached
+
+                api_key, _ = self._get_cloud_config()
+                if not api_key and self._cloud_transport is None:
+                    return _tool_result(
+                        {
+                            "error": "APPROVAL_NOT_GRANTED",
+                            "detail": "CLEARFILLS_API_KEY is required to verify cloud approval status.",
+                            "approval_id": approval_id,
+                        },
+                        is_error=True,
+                    )
+
+                try:
+                    approvals_resp = self._cloud_request("GET", "/api/v1/cloud/approvals", timeout=5.0)
+                except Exception as exc:
+                    return _tool_result(
+                        {
+                            "error": "APPROVAL_NOT_GRANTED",
+                            "detail": f"Failed to verify cloud approval {approval_id!r}: {exc}",
+                            "approval_id": approval_id,
+                        },
+                        is_error=True,
+                    )
+
+                if isinstance(approvals_resp, list):
+                    approval_items = approvals_resp
+                elif isinstance(approvals_resp, dict):
+                    raw_items = approvals_resp.get("approvals")
+                    if raw_items is None:
+                        raw_items = approvals_resp.get("items")
+                    approval_items = raw_items if isinstance(raw_items, list) else []
+                else:
+                    approval_items = []
+
+                approval_record: Optional[dict[str, Any]] = None
+                for item in approval_items:
+                    if isinstance(item, dict) and str(item.get("approval_id") or item.get("id") or "") == approval_id:
+                        approval_record = item
+                        break
+
+                if approval_record is None:
+                    return _tool_result(
+                        {
+                            "error": "APPROVAL_NOT_GRANTED",
+                            "detail": f"Approval {approval_id!r} was not found in ClearFills Cloud.",
+                            "approval_id": approval_id,
+                        },
+                        is_error=True,
+                    )
+
+                approval_status = str(approval_record.get("status") or "").strip().lower()
+                if approval_status != "approved":
+                    return _tool_result(
+                        {
+                            "error": "APPROVAL_NOT_GRANTED",
+                            "detail": f"Approval {approval_id!r} has status {approval_status!r}; expected 'approved'.",
+                            "approval_id": approval_id,
+                            "status": approval_status,
+                        },
+                        is_error=True,
+                    )
+
+                nested = (
+                    approval_record.get("order_summary")
+                    if isinstance(approval_record.get("order_summary"), dict)
+                    else (
+                        approval_record.get("proposal")
+                        if isinstance(approval_record.get("proposal"), dict)
+                        else {}
+                    )
+                )
+                ap_symbol = str(approval_record.get("symbol") or nested.get("symbol") or "").strip().upper()
+                ap_side = str(approval_record.get("side") or nested.get("side") or "").strip().upper()
+                ap_qty_raw = (
+                    approval_record.get("quantity")
+                    if approval_record.get("quantity") is not None
+                    else nested.get("quantity")
+                )
+                try:
+                    ap_qty: Optional[float] = float(ap_qty_raw) if ap_qty_raw is not None else None
+                except (TypeError, ValueError):
+                    ap_qty = None
+
+                expected_symbol = cached_proposal.symbol.upper()
+                expected_side = cached_proposal.side.value.upper()
+                expected_qty = float(cached_proposal.quantity)
+                if (
+                    ap_symbol != expected_symbol
+                    or ap_side != expected_side
+                    or ap_qty is None
+                    or abs(ap_qty - expected_qty) > 1e-6
+                ):
+                    return _tool_result(
+                        {
+                            "error": "APPROVAL_NOT_GRANTED",
+                            "detail": (
+                                f"Approval {approval_id!r} parameters ({ap_side} {ap_qty} {ap_symbol}) "
+                                f"do not match cached attestation ({expected_side} {expected_qty} {expected_symbol})."
+                            ),
+                            "approval_id": approval_id,
+                        },
+                        is_error=True,
+                    )
+
+                exec_res = self._dispatch_tool(
+                    "execute_attested_order",
+                    {
+                        "proposal": cached_proposal.model_dump(mode="json"),
+                        "attestation_id": att_id,
+                        "human_confirmed": True,
+                    },
+                )
+                if exec_res.get("isError"):
+                    return exec_res
+
+                receipt_payload = json.loads(exec_res["content"][0]["text"])
+                quoted_id = urllib.parse.quote(approval_id, safe="")
+                report_body = {
+                    "attestation_id": att_id,
+                    "order_ids": receipt_payload.get("order_ids", []),
+                    "execution_mode": receipt_payload.get("execution_mode"),
+                    "submitted_at": receipt_payload.get("submitted_at"),
+                    "execution_receipt": receipt_payload,
+                }
+                receipt_payload["cloud_approval_id"] = approval_id
+                try:
+                    cloud_exec_resp = self._cloud_request(
+                        "POST",
+                        f"/api/v1/cloud/approvals/{quoted_id}/executed",
+                        report_body,
+                        timeout=5.0,
+                    )
+                    receipt_payload["cloud_execution_reported"] = True
+                    if isinstance(cloud_exec_resp, dict):
+                        receipt_payload["cloud_execution_response"] = cloud_exec_resp
+                except Exception as exc:
+                    receipt_payload["cloud_execution_reported"] = False
+                    receipt_payload["cloud_report_error"] = str(exc)
+
+                return _tool_result(receipt_payload)
 
             if tool_name == "list_open_orders":
                 return _tool_result({"open_orders": self.adapter.list_open_orders()})

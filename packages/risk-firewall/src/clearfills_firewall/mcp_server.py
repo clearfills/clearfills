@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional, TextIO
 
@@ -202,6 +203,75 @@ CLOUD_TOOL_DEFINITIONS: list[dict[str, Any]] = TOOL_DEFINITIONS + [
             "required": ["account_key", "institution", "account_name"],
         },
     },
+    {
+        "name": "submit_for_approval",
+        "description": "Submit a trade proposal to the ClearFills Cloud human-in-the-loop approval queue.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity": {"type": "number"},
+                "order_type": {"type": "string", "default": "LIMIT"},
+                "limit_price": {"type": "number"},
+                "stop_price": {"type": "number"},
+                "target_price": {"type": "number"},
+                "notional_usd": {"type": "number"},
+                "attestation_id": {"type": "string"},
+                "proposal_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "venue": {"type": "string"},
+                "sleeve": {"type": "string"},
+                "reasoning_trace": {"type": "string"},
+                "order_summary": {"type": "object"},
+            },
+            "required": ["symbol", "side", "quantity"],
+        },
+    },
+    {
+        "name": "list_approvals",
+        "description": "List trade approval requests from your ClearFills Cloud approval queue.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["pending", "approved", "rejected", "executed", "expired"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "list_mandates",
+        "description": "List active portfolio allocation mandates and risk rules configured in ClearFills Cloud.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "evaluate_mandates",
+        "description": "Evaluate a portfolio snapshot or trade proposal against your ClearFills Cloud mandates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "portfolio": {"type": "object"},
+                "proposal": {"type": "object"},
+                "entity": {"type": "string", "enum": ["all", "personal", "corporate", "holdco", "joint", "trust"]},
+            },
+        },
+    },
+    {
+        "name": "get_track_record",
+        "description": "Retrieve the cryptographically attested trading track record and performance metrics from ClearFills Cloud.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string"},
+                "strategy_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+        },
+    },
 ]
 
 
@@ -308,6 +378,30 @@ def _handle_cloud_tool_call(
             return _tool_result(cloud.request("GET", query))
         if tool_name == "sync_account_snapshot":
             return _tool_result(cloud.request("POST", "/api/v1/cloud/accounts/sync", arguments))
+        if tool_name == "submit_for_approval":
+            return _tool_result(cloud.request("POST", "/api/v1/cloud/approvals", arguments))
+        if tool_name == "list_approvals":
+            params_list: list[str] = []
+            if arguments.get("status"):
+                params_list.append(f"status={urllib.parse.quote(str(arguments['status']).strip().lower())}")
+            if arguments.get("limit") is not None:
+                params_list.append(f"limit={int(arguments['limit'])}")
+            path = "/api/v1/cloud/approvals" + (f"?{'&'.join(params_list)}" if params_list else "")
+            return _tool_result(cloud.request("GET", path))
+        if tool_name == "list_mandates":
+            return _tool_result(cloud.request("GET", "/api/v1/cloud/mandates"))
+        if tool_name == "evaluate_mandates":
+            return _tool_result(cloud.request("POST", "/api/v1/cloud/mandates/evaluate", arguments))
+        if tool_name == "get_track_record":
+            params_list = []
+            if arguments.get("agent_id"):
+                params_list.append(f"agent_id={urllib.parse.quote(str(arguments['agent_id']).strip())}")
+            if arguments.get("strategy_id"):
+                params_list.append(f"strategy_id={urllib.parse.quote(str(arguments['strategy_id']).strip())}")
+            if arguments.get("limit") is not None:
+                params_list.append(f"limit={int(arguments['limit'])}")
+            path = "/api/v1/cloud/track-record" + (f"?{'&'.join(params_list)}" if params_list else "")
+            return _tool_result(cloud.request("GET", path))
         return _tool_result({"error": f"Unknown tool: {tool_name}"}, is_error=True)
     except Exception as exc:
         return _tool_result({"error": "CLOUD_API_ERROR", "detail": str(exc)}, is_error=True)

@@ -337,3 +337,219 @@ def test_tailnet_relay_validation_paper_and_live() -> None:
             "live",
             env={"CLEARFILLS_ALLOW_LIVE": "1"},
         )
+
+
+def _make_live_server_with_cloud(
+    tmp_path: Path,
+    cloud_transport: Any,
+    api_key: str = "cf_sk_test_cloud",
+) -> tuple[BrokerMCPServer, _FakeIB]:
+    server, fake_ib = _make_live_server(tmp_path)
+    cloud_server = BrokerMCPServer(
+        server.adapter,
+        cloud_api_key=api_key,
+        cloud_api_url="https://clearfills-api.fly.dev",
+        cloud_transport=cloud_transport,
+    )
+    return cloud_server, fake_ib
+
+
+def test_preview_order_auto_submits_cloud_approval_above_threshold(tmp_path: Path) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_transport(method: str, path: str, body: Any) -> dict[str, Any]:
+        calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/approvals":
+            return {
+                "approval_id": "apr_001",
+                "status": "pending",
+                "approval_url": "https://clearfills.com/approvals/apr_001",
+            }
+        raise AssertionError(f"Unexpected cloud call: {method} {path}")
+
+    server, _ = _make_live_server_with_cloud(tmp_path, fake_transport)
+
+    # Above threshold ($100,250 >= $25,000) auto-submits pending approval
+    large_proposal = {
+        "agent_id": "allocator-agent",
+        "venue": "ibkr",
+        "symbol": "SGOV",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 1000,
+        "limit_price": 100.25,
+        "created_at": _FRIDAY_ET,
+    }
+    preview, p_err = _call_tool(server, "preview_order", {"proposal": large_proposal})
+    assert not p_err
+    assert preview["approved"] is True
+    assert preview["requires_human_confirmation"] is True
+    assert preview["cloud_approval"] == {
+        "approval_id": "apr_001",
+        "status": "pending",
+        "approval_url": "https://clearfills.com/approvals/apr_001",
+    }
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == "/api/v1/cloud/approvals"
+    assert calls[0][2]["symbol"] == "SGOV"
+    assert calls[0][2]["quantity"] == 1000
+
+    # Below threshold ($13,000 < $25,000) does NOT submit cloud approval
+    small_proposal = {
+        "agent_id": "swing-bot",
+        "venue": "ibkr",
+        "symbol": "NVDA",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 100,
+        "limit_price": 130.0,
+        "stop_price": 120.0,
+        "created_at": _MONDAY_ET,
+    }
+    small_preview, sp_err = _call_tool(server, "preview_order", {"proposal": small_proposal})
+    assert not sp_err
+    assert small_preview["approved"] is True
+    assert "cloud_approval" not in small_preview
+    assert len(calls) == 1
+
+    # Offline / failing cloud transport never breaks preview_order
+    def offline_transport(method: str, path: str, body: Any) -> dict[str, Any]:
+        raise OSError("network unreachable")
+
+    offline_server, _ = _make_live_server_with_cloud(tmp_path / "offline", offline_transport)
+    off_preview, off_err = _call_tool(offline_server, "preview_order", {"proposal": large_proposal})
+    assert not off_err
+    assert off_preview["approved"] is True
+    assert "cloud_approval" not in off_preview
+
+
+def test_execute_approved_order_fails_closed_when_not_approved_or_mismatched(tmp_path: Path) -> None:
+    approval_state: dict[str, Any] = {
+        "approval_id": "apr_pending",
+        "status": "pending",
+        "symbol": "SGOV",
+        "side": "BUY",
+        "quantity": 1000,
+    }
+
+    def fake_transport(method: str, path: str, body: Any) -> Any:
+        if method == "POST" and path == "/api/v1/cloud/approvals":
+            return {"approval_id": "apr_pending", "status": "pending"}
+        if method == "GET" and path == "/api/v1/cloud/approvals":
+            return [dict(approval_state)]
+        raise AssertionError(f"Unexpected cloud call: {method} {path}")
+
+    server, fake_ib = _make_live_server_with_cloud(tmp_path, fake_transport)
+    proposal = {
+        "agent_id": "allocator-agent",
+        "venue": "ibkr",
+        "symbol": "SGOV",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 1000,
+        "limit_price": 100.25,
+        "created_at": _FRIDAY_ET,
+    }
+    preview, p_err = _call_tool(server, "preview_order", {"proposal": proposal})
+    assert not p_err
+    att_id = preview["attestation_id"]
+
+    # Pending -> fails closed
+    res_pending, err_pending = _call_tool(
+        server,
+        "execute_approved_order",
+        {"approval_id": "apr_pending", "attestation_id": att_id},
+    )
+    assert err_pending is True
+    assert res_pending["error"] == "APPROVAL_NOT_GRANTED"
+    assert res_pending["status"] == "pending"
+    assert len(fake_ib.placed) == 0
+
+    # Rejected -> fails closed
+    approval_state["status"] = "rejected"
+    res_rej, err_rej = _call_tool(
+        server,
+        "execute_approved_order",
+        {"approval_id": "apr_pending", "attestation_id": att_id},
+    )
+    assert err_rej is True
+    assert res_rej["error"] == "APPROVAL_NOT_GRANTED"
+    assert res_rej["status"] == "rejected"
+    assert len(fake_ib.placed) == 0
+
+    # Approved but mismatched quantity -> fails closed
+    approval_state["status"] = "approved"
+    approval_state["quantity"] = 500
+    res_mis, err_mis = _call_tool(
+        server,
+        "execute_approved_order",
+        {"approval_id": "apr_pending", "attestation_id": att_id},
+    )
+    assert err_mis is True
+    assert res_mis["error"] == "APPROVAL_NOT_GRANTED"
+    assert len(fake_ib.placed) == 0
+
+
+def test_execute_approved_order_succeeds_and_reports_receipt_when_approved(tmp_path: Path) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_transport(method: str, path: str, body: Any) -> Any:
+        calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/approvals":
+            return {
+                "approval_id": "apr_ok_42",
+                "status": "pending",
+                "approval_url": "https://clearfills.com/approvals/apr_ok_42",
+            }
+        if method == "GET" and path == "/api/v1/cloud/approvals":
+            return {
+                "approvals": [
+                    {
+                        "approval_id": "apr_ok_42",
+                        "status": "approved",
+                        "symbol": "SGOV",
+                        "side": "BUY",
+                        "quantity": 1000,
+                    }
+                ]
+            }
+        if method == "POST" and path == "/api/v1/cloud/approvals/apr_ok_42/executed":
+            return {"approval_id": "apr_ok_42", "status": "executed"}
+        raise AssertionError(f"Unexpected cloud call: {method} {path}")
+
+    server, fake_ib = _make_live_server_with_cloud(tmp_path, fake_transport)
+    proposal = {
+        "agent_id": "allocator-agent",
+        "venue": "ibkr",
+        "symbol": "SGOV",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 1000,
+        "limit_price": 100.25,
+        "created_at": _FRIDAY_ET,
+    }
+    preview, p_err = _call_tool(server, "preview_order", {"proposal": proposal})
+    assert not p_err
+    att_id = preview["attestation_id"]
+    approval_id = preview["cloud_approval"]["approval_id"]
+    assert approval_id == "apr_ok_42"
+
+    receipt, r_err = _call_tool(
+        server,
+        "execute_approved_order",
+        {"approval_id": approval_id, "attestation_id": att_id},
+    )
+    assert not r_err
+    assert receipt["execution_mode"] == "live"
+    assert receipt["symbol"] == "SGOV"
+    assert receipt["cloud_approval_id"] == "apr_ok_42"
+    assert receipt["cloud_execution_reported"] is True
+    assert receipt["cloud_execution_response"] == {"approval_id": "apr_ok_42", "status": "executed"}
+    assert len(fake_ib.placed) == 1
+
+    # Verify the executed callback was sent with the fill receipt
+    exec_calls = [c for c in calls if c[0] == "POST" and c[1] == "/api/v1/cloud/approvals/apr_ok_42/executed"]
+    assert len(exec_calls) == 1
+    assert exec_calls[0][2]["attestation_id"] == att_id
+    assert exec_calls[0][2]["execution_receipt"]["symbol"] == "SGOV"

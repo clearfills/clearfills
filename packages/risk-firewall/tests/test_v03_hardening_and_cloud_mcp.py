@@ -81,3 +81,59 @@ def test_cloud_mcp_mode_exposes_trading_os_tools() -> None:
     payload = json.loads(res["result"]["content"][0]["text"])
     assert payload["ok"] is True
     assert calls[0][0] == "POST" and calls[0][1] == "/api/v1/cloud/watchlists"
+
+
+def test_cloud_mcp_approvals_mandates_and_track_record_tools() -> None:
+    calls: list[tuple[str, str, object]] = []
+
+    def fake_transport(method: str, path: str, body: object) -> dict:
+        calls.append((method, path, body))
+        return {"ok": True, "method": method, "path": path}
+
+    cloud = CloudMCPClient(api_key="cf_sk_test_456", transport=fake_transport)
+
+    listed = handle_jsonrpc_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, None, cloud_client=cloud)
+    assert listed is not None
+    names = {t["name"] for t in listed["result"]["tools"]}
+    assert {
+        "submit_for_approval",
+        "list_approvals",
+        "list_mandates",
+        "evaluate_mandates",
+        "get_track_record",
+    }.issubset(names)
+
+    def _call(tool_name: str, arguments: dict | None = None) -> dict:
+        resp = handle_jsonrpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments or {}},
+            },
+            None,
+            cloud_client=cloud,
+        )
+        assert resp is not None
+        assert resp["result"]["isError"] is False
+        return json.loads(resp["result"]["content"][0]["text"])
+
+    _call("submit_for_approval", {"symbol": "SGOV", "side": "BUY", "quantity": 500, "notional_usd": 50125.0})
+    _call("list_approvals", {"status": "pending", "limit": 20})
+    _call("list_mandates")
+    _call("evaluate_mandates", {"entity": "personal", "portfolio": {"nav_usd": 500000.0}})
+    _call("get_track_record", {"agent_id": "swing-bot", "limit": 50})
+
+    assert calls[0] == (
+        "POST",
+        "/api/v1/cloud/approvals",
+        {"symbol": "SGOV", "side": "BUY", "quantity": 500, "notional_usd": 50125.0},
+    )
+    assert calls[1] == ("GET", "/api/v1/cloud/approvals?status=pending&limit=20", None)
+    assert calls[2] == ("GET", "/api/v1/cloud/mandates", None)
+    assert calls[3] == (
+        "POST",
+        "/api/v1/cloud/mandates/evaluate",
+        {"entity": "personal", "portfolio": {"nav_usd": 500000.0}},
+    )
+    assert calls[4] == ("GET", "/api/v1/cloud/track-record?agent_id=swing-bot&limit=50", None)
