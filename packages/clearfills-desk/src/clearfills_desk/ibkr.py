@@ -52,7 +52,7 @@ def mask_account_id(account_id: str) -> str:
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         num = float(value)
-        if num != num:  # NaN check
+        if num != num or abs(num) >= 1e100:  # NaN or IBKR UNSET_DOUBLE (DBL_MAX)
             return default
         return num
     except (TypeError, ValueError):
@@ -295,6 +295,7 @@ class IBKRExecutionAdapter:
         nav_usd = 0.0
         buying_power_usd = 0.0
         daily_pnl_usd = 0.0
+        accrued_cash_usd = 0.0
         cash_by_currency: dict[str, float] = {}
         settled_by_currency: dict[str, float] = {}
 
@@ -308,6 +309,8 @@ class IBKRExecutionAdapter:
                 buying_power_usd = val
             elif tag in {"RealizedPnL", "DailyPnL"} and ccy in {"USD", "BASE", ""}:
                 daily_pnl_usd = val
+            elif tag == "AccruedCash" and ccy in {"USD", "BASE", ""}:
+                accrued_cash_usd = val
             elif tag == "TotalCashBalance" and ccy and ccy != "BASE":
                 cash_by_currency[ccy] = val
             elif tag == "SettledCash" and ccy and ccy != "BASE":
@@ -356,6 +359,7 @@ class IBKRExecutionAdapter:
             "settled_cash_cad": round(settled_cad, 2),
             "cash_by_currency": {k: round(v, 2) for k, v in sorted(cash_by_currency.items())},
             "buying_power_usd": round(buying_power_usd, 2),
+            "accrued_interest_usd": round(accrued_cash_usd, 2),
             "daily_pnl_usd": round(daily_pnl_usd, 2),
             "positions": positions,
             "open_orders": open_orders,
