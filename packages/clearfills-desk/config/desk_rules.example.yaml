@@ -1,0 +1,21 @@
+# ClearFills Desk OS — Reference Paper Desk Policy
+# All limits are enforced deterministically by clearfills-firewall >= 0.2.0.
+
+desk_id: my-ai-desk
+desk_name: My 6-Agent Desk
+execution_mode: paper # paper | shadow | enforce
+venue: ibkr
+
+risk:
+  max_risk_per_trade_pct: 1.0
+  max_open_positions: 10
+  max_total_heat_pct: 12.0
+  max_daily_loss_pct: 2.0
+  max_order_notional_usd: 50000.0
+  max_gross_exposure_pct: 100.0
+  max_entries_per_session: 4
+  no_entries_after_et: "15:30"
+  block_last_session_of_week: true
+  require_stop_loss: true
+  allow_shorting: false
+  enforce_kelly_sizing: false

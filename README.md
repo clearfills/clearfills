@@ -3,8 +3,9 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-10B981.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Website](https://img.shields.io/badge/site-clearfills.com-090B10.svg)](https://clearfills.com)
+[![ClearFills Verified](https://clearfills-api.fly.dev/api/v1/badge/six-agent-desk.svg)](https://clearfills.com/?desk=six-agent-desk)
 
-**Deterministic Ed25519 pre-trade risk firewall & MCP server for AI trading agents.**
+**Deterministic Ed25519 pre-trade risk firewall, MCP server, and open-source 6-Agent Desk OS (`packages/clearfills-desk`) for AI trading agents.**
 
 Sits between any untrusted AI trading agent (Claude, Grok, Codex, `TradingAgents`, `ai-hedge-fund`, or custom Python loops) and your execution gateway so LLMs **never hold brokerage API keys** and can never hallucinate or get prompt-injected into an unbounded market sweep.
 

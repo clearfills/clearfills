@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+_ET = ZoneInfo("America/New_York")
 
 from .killswitch import KillSwitch
 from .models import (
@@ -40,6 +43,10 @@ class RiskPolicy(BaseModel):
     max_prediction_market_exposure_pct: float = Field(default=15.0, ge=0.0, le=100.0)
     fractional_kelly_multiplier: float = Field(default=0.25, gt=0.0, le=1.0)
     enforce_kelly_sizing: bool = Field(default=True)
+    max_entries_per_session: Optional[int] = Field(default=None, ge=1)
+    block_last_session_of_week: bool = Field(default=False)
+    no_entries_after_et: Optional[str] = Field(default=None)
+    max_gross_exposure_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "RiskPolicy":
@@ -142,6 +149,35 @@ def evaluate_proposal(
             f"Open positions ({portfolio.open_position_count}) already at max_open_positions ({policy.max_open_positions})",
         )
 
+    # 6b. Session entry caps & calendar/time-of-day cutoffs (never block closing/reducing orders)
+    if not is_reducing_position:
+        if (
+            policy.max_entries_per_session is not None
+            and portfolio.session_entries >= policy.max_entries_per_session
+        ):
+            add_veto(
+                "MAX_ENTRIES_PER_SESSION_EXCEEDED",
+                f"Session entries ({portfolio.session_entries}) already at max_entries_per_session ({policy.max_entries_per_session})",
+            )
+
+        eval_et = proposal.created_at.astimezone(_ET)
+        if policy.block_last_session_of_week and eval_et.weekday() == 4:
+            add_veto(
+                "LAST_SESSION_OF_WEEK_BLOCKED",
+                "Policy blocks new entries on the last session of the week (Friday ET)",
+            )
+
+        if policy.no_entries_after_et:
+            try:
+                cutoff_h, cutoff_m = (int(x) for x in policy.no_entries_after_et.strip().split(":", 1))
+                if (eval_et.hour, eval_et.minute) >= (cutoff_h, cutoff_m):
+                    add_veto(
+                        "SESSION_CUTOFF_EXCEEDED",
+                        f"Order time {eval_et.strftime('%H:%M')} ET is at or after no_entries_after_et ({policy.no_entries_after_et} ET)",
+                    )
+            except ValueError:
+                pass
+
     # 7. Reference / entry price required for deterministic sizing
     entry_price: Optional[float] = proposal.limit_price
     if entry_price is None or entry_price <= 0:
@@ -160,6 +196,16 @@ def evaluate_proposal(
                 "MAX_ORDER_NOTIONAL_EXCEEDED",
                 f"Order notional ${order_notional_usd:,.2f} exceeds max_order_notional_usd ${policy.max_order_notional_usd:,.2f}",
             )
+
+        # 8b. Max gross exposure cap (for new/expanding positions)
+        if policy.max_gross_exposure_pct is not None and not is_reducing_position:
+            projected_gross_pct = ((portfolio.gross_exposure_usd + order_notional_usd) / portfolio.nav_usd) * 100.0
+            metrics["projected_gross_exposure_pct"] = round(projected_gross_pct, 4)
+            if projected_gross_pct > policy.max_gross_exposure_pct:
+                add_veto(
+                    "MAX_GROSS_EXPOSURE_EXCEEDED",
+                    f"Projected gross exposure {projected_gross_pct:.2f}% exceeds max_gross_exposure_pct {policy.max_gross_exposure_pct:.2f}%",
+                )
 
         # 9. Stop-loss validation & stop-distance risk computation
         is_pm = _is_prediction_market(proposal)

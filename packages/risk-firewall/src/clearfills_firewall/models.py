@@ -121,8 +121,17 @@ class PortfolioSnapshot(BaseModel):
     nav_usd: float = Field(..., gt=0.0, description="Net asset value in USD")
     cash_usd: float = Field(..., ge=0.0, description="Available cash in USD")
     daily_pnl_usd: float = Field(default=0.0, description="Realized + unrealized P&L for current trading day")
+    session_entries: int = Field(default=0, ge=0, description="New entry orders already executed in current session")
     open_positions: list[Position] = Field(default_factory=list)
     timestamp: datetime = Field(default_factory=utc_now)
+
+    @property
+    def gross_exposure_usd(self) -> float:
+        return sum(pos.market_value_usd for pos in self.open_positions if pos.quantity != 0)
+
+    @property
+    def gross_exposure_pct(self) -> float:
+        return (self.gross_exposure_usd / self.nav_usd) * 100.0
 
     @property
     def open_position_count(self) -> int:
