@@ -13,6 +13,7 @@ ClearFills Cloud.
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -22,11 +23,12 @@ from typing import Any, Callable, Optional, TextIO
 
 from clearfills_firewall import OrderType, Side, TradeProposal
 
-from .ibkr import IBKRExecutionAdapter, LiveExecutionSafetyError
+from .ibkr import IBKRExecutionAdapter, LiveExecutionSafetyError, mask_account_id
 from .telemetry import sanitize_text
 
 DEFAULT_CLOUD_API_URL = "https://clearfills-api.fly.dev"
 _IBKR_VENUE = "ibkr"
+_DEFAULT_HEARTBEAT_INTERVAL_SEC = 15.0
 
 
 class CloudHTTPError(RuntimeError):
@@ -93,6 +95,8 @@ class ApprovalWorker:
         dry_run: bool = False,
         cloud_transport: Optional[Callable[[str, str, Optional[dict[str, Any]]], Any]] = None,
         timeout: float = 10.0,
+        worker_id: Optional[str] = None,
+        heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC,
     ) -> None:
         self.adapter = adapter
         self.api_key = api_key.strip()
@@ -101,6 +105,11 @@ class ApprovalWorker:
         self.dry_run = bool(dry_run)
         self._cloud_transport = cloud_transport
         self._timeout = float(timeout)
+        desk_id = getattr(getattr(getattr(adapter, "runtime", None), "config", None), "desk_id", "desk")
+        default_worker_id = f"{desk_id}-{socket.gethostname()}"
+        self.worker_id = (worker_id or default_worker_id).strip() or default_worker_id
+        self._heartbeat_interval_sec = float(heartbeat_interval_sec)
+        self._last_heartbeat_at: Optional[float] = None
 
     def _cloud_request(
         self,
@@ -360,8 +369,30 @@ class ApprovalWorker:
             "receipt": receipt_dict,
         }
 
+    def send_heartbeat(self) -> None:
+        """Best-effort worker heartbeat to ClearFills Cloud (never crashes the poll loop)."""
+        self._last_heartbeat_at = time.monotonic()
+        try:
+            account_id = self.adapter.runtime.config.ibkr.account_id or ""
+            payload = {
+                "worker_id": self.worker_id,
+                "venue": _IBKR_VENUE,
+                "execution_mode": self.adapter._mode,
+                "account_masked": mask_account_id(account_id),
+                "max_slippage_bps": self.max_slippage_bps,
+                "dry_run": self.dry_run,
+            }
+            self._cloud_request("POST", "/api/v1/cloud/worker/heartbeat", payload)
+        except Exception:
+            # Best-effort telemetry; never crash the poll loop if offline or endpoint returns 404.
+            pass
+
     def poll_once(self) -> list[dict[str, Any]]:
         """Fetch approved IBKR orders once and process each one safely."""
+        now = time.monotonic()
+        if self._last_heartbeat_at is None or (now - self._last_heartbeat_at) >= self._heartbeat_interval_sec:
+            self.send_heartbeat()
+
         raw = self._cloud_request("GET", "/api/v1/cloud/approvals?status=approved")
         approvals = _extract_approvals(raw)
 

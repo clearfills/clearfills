@@ -140,6 +140,8 @@ def test_happy_path_approved_ibkr_order_claimed_attested_and_executed(tmp_path: 
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -182,13 +184,23 @@ def test_happy_path_approved_ibkr_order_claimed_attested_and_executed(tmp_path: 
     # Exactly 1 order placed on IBKR
     assert len(fake_ib.placed) == 1
 
-    # Verify cloud call sequence: GET -> claim -> executed
+    # Verify cloud call sequence: heartbeat -> GET -> claim -> executed
     assert [c[:2] for c in calls] == [
+        ("POST", "/api/v1/cloud/worker/heartbeat"),
         ("GET", "/api/v1/cloud/approvals?status=approved"),
         ("POST", "/api/v1/cloud/approvals/apr_live_001/claim"),
         ("POST", "/api/v1/cloud/approvals/apr_live_001/executed"),
     ]
-    exec_body = calls[2][2]
+    hb_body = calls[0][2]
+    assert hb_body == {
+        "worker_id": worker.worker_id,
+        "venue": "ibkr",
+        "execution_mode": "live",
+        "account_masked": "***001",
+        "max_slippage_bps": 50.0,
+        "dry_run": False,
+    }
+    exec_body = calls[3][2]
     assert exec_body["status"] == "submitted"
     assert exec_body["broker_order_id"] == "7001"
     assert exec_body["fill_price"] == pytest.approx(100.30)
@@ -202,6 +214,8 @@ def test_slippage_guard_fails_closed_and_reports_slippage_rejected(tmp_path: Pat
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -247,6 +261,8 @@ def test_claim_conflict_409_skips_cleanly_without_submitting(tmp_path: Path) -> 
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -276,7 +292,7 @@ def test_claim_conflict_409_skips_cleanly_without_submitting(tmp_path: Path) -> 
     assert outcomes[0]["status"] == "claim_conflict"
     assert len(fake_ib.quote_calls) == 0
     assert len(fake_ib.placed) == 0
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_non_ibkr_venue_clearfills_sandbox_is_ignored(tmp_path: Path) -> None:
@@ -285,6 +301,8 @@ def test_non_ibkr_venue_clearfills_sandbox_is_ignored(tmp_path: Path) -> None:
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -309,7 +327,7 @@ def test_non_ibkr_venue_clearfills_sandbox_is_ignored(tmp_path: Path) -> None:
     assert outcomes == []
     assert len(fake_ib.quote_calls) == 0
     assert len(fake_ib.placed) == 0
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 def test_dry_run_validates_and_attests_without_ibkr_submit(tmp_path: Path) -> None:
@@ -318,6 +336,8 @@ def test_dry_run_validates_and_attests_without_ibkr_submit(tmp_path: Path) -> No
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -360,6 +380,8 @@ def test_firewall_denied_when_kill_switch_tripped(tmp_path: Path) -> None:
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
             return [
                 {
@@ -403,3 +425,79 @@ def test_cli_watch_requires_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
     assert "CLEARFILLS_API_KEY" in payload["error"]
+
+
+def test_heartbeat_sent_on_first_poll_and_throttled_to_15s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _ = _make_adapter(tmp_path)
+    calls: list[tuple[str, str, Any]] = []
+    now_clock = [1000.0]
+
+    monkeypatch.setattr("clearfills_desk.worker.time.monotonic", lambda: now_clock[0])
+
+    def fake_transport(method: str, path: str, body: Any) -> Any:
+        calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            return {"ok": True}
+        if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
+            return []
+        raise AssertionError(f"Unexpected cloud request: {method} {path}")
+
+    worker = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test_key",
+        max_slippage_bps=35.0,
+        dry_run=True,
+        cloud_transport=fake_transport,
+        worker_id="worker-ibkr-01",
+    )
+
+    # First poll always sends heartbeat
+    worker.poll_once()
+    heartbeats = [c for c in calls if c[:2] == ("POST", "/api/v1/cloud/worker/heartbeat")]
+    assert len(heartbeats) == 1
+    assert heartbeats[0][2] == {
+        "worker_id": "worker-ibkr-01",
+        "venue": "ibkr",
+        "execution_mode": "live",
+        "account_masked": "***001",
+        "max_slippage_bps": 35.0,
+        "dry_run": True,
+    }
+
+    # Second poll within 15s is throttled
+    now_clock[0] += 10.0
+    worker.poll_once()
+    heartbeats = [c for c in calls if c[:2] == ("POST", "/api/v1/cloud/worker/heartbeat")]
+    assert len(heartbeats) == 1
+
+    # Third poll after >= 15s sends heartbeat again
+    now_clock[0] += 5.0
+    worker.poll_once()
+    heartbeats = [c for c in calls if c[:2] == ("POST", "/api/v1/cloud/worker/heartbeat")]
+    assert len(heartbeats) == 2
+
+
+def test_heartbeat_404_or_offline_never_crashes_poll_once(tmp_path: Path) -> None:
+    adapter, _ = _make_adapter(tmp_path)
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_transport(method: str, path: str, body: Any) -> Any:
+        calls.append((method, path, body))
+        if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
+            raise CloudHTTPError(404, "Not Found")
+        if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
+            return []
+        raise AssertionError(f"Unexpected cloud request: {method} {path}")
+
+    worker = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test_key",
+        cloud_transport=fake_transport,
+    )
+    assert worker.poll_once() == []
+    assert [c[:2] for c in calls] == [
+        ("POST", "/api/v1/cloud/worker/heartbeat"),
+        ("GET", "/api/v1/cloud/approvals?status=approved"),
+    ]
