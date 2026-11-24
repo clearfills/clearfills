@@ -1,42 +1,49 @@
-# ClearFills Desk OS (`clearfills-desk`)
+# `clearfills-desk`
 
-Open-source, bring-your-own-LLM, bring-your-own-strategy **6-Agent Trading Desk** architecture with **`clearfills-firewall>=0.2.0`** as the sole deterministic pre-trade risk authority.
+Open-source broker execution layer, MCP server, and 1-tap approval worker powered by [`clearfills-firewall`](https://pypi.org/project/clearfills-firewall/) ([clearfills.com](https://clearfills.com)).
 
-## Architecture (6 Roles, Zero Broker Keys for LLMs)
+AI agents **never hold broker credentials**. `clearfills-desk` connects to your local or Tailscale-meshed IBKR Gateway, enforces deterministic Ed25519 risk attestations before any order touches the broker, and bridges your ClearFills Cloud `Inbox` to live execution.
 
-1. **Researcher** — gathers filings, catalysts, and market data (read-only).
-2. **Strategist** — proposes structured `TradeProposal` intents with explicit entry, stop-loss, and thesis citations.
-3. **Risk Officer** — delegates deterministically to `clearfills-firewall` (`RiskPolicy` YAML: per-trade risk, total open heat, session entry caps, ET cutoff time, Friday entry block, daily loss kill-switch, and 120s single-use Ed25519 attestations).
-4. **Trader (Execution Gateway)** — verifies the single-use Ed25519 attestation via `dispatch_check()` before routing to IBKR / Alpaca / Polymarket / Paper.
-5. **Chief of Staff** — relays operator desk decisions and monitors heartbeats / Slack alerts.
-6. **Auditor** — verifies the SHA-256 hash-chained audit ledger and publishes sanitized heartbeats + Strategy Receipts to the ClearFills Arena.
+## CLI Commands
 
-## Quickstart
+```bash
+# 1. Validate a paper or live YAML config (fail-closed)
+clearfills-desk validate --config config/desk_rules.example.yaml
+CLEARFILLS_ALLOW_LIVE=1 clearfills-desk validate --config config/desk_rules.live.example.yaml
 
-```python
-from pathlib import Path
-from clearfills_desk import DeskConfig, DeskRuntime, IBKRExecutionAdapter
+# 2. Sync live balances & holdings into ClearFills Cloud Net Worth
+clearfills-desk sync ibkr --config desk.live.yaml
+clearfills-desk sync evm --address 0x... --entity personal
+clearfills-desk sync file --path accounts.json
 
-cfg = DeskConfig.from_yaml(Path("config/desk_rules.example.yaml"))
-runtime = DeskRuntime(config=cfg, state_dir=Path("./state"))
-decision = runtime.evaluate_proposal(proposal, portfolio)
+# 3. Run the 1-tap Approval Queue execution worker (polls Cloud Inbox every 3s)
+CLEARFILLS_ALLOW_LIVE=1 CLEARFILLS_API_KEY="cf_sk_..." \
+  clearfills-desk watch --config desk.live.yaml --max-slippage-bps 50
 
-# Paper (4002/7497 + DU*) or Live (4001/7496 + non-DU* + two-key opt-in)
-adapter = IBKRExecutionAdapter(runtime)
-receipt = adapter.submit_attested_order(proposal, decision.attestation)
+# Safe dry-run test (verifies heartbeat + quote + firewall without transmitting orders)
+CLEARFILLS_ALLOW_LIVE=1 CLEARFILLS_API_KEY="cf_sk_..." \
+  clearfills-desk watch --config desk.live.yaml --once --dry-run
 ```
 
-## Live IBKR Execution (Fail-Closed Two-Key Opt-In)
+## MCP Server (`clearfills-desk-mcp`)
 
-Live trading is **refused by default**. To connect a capped live IBKR Gateway sleeve (e.g., port `4001`, US\$25k–\$50k notional cap):
+Attach `clearfills-desk-mcp` to Claude Code, Codex, or Cursor:
 
-1. Start IB Gateway on loopback (`127.0.0.1:4001`, or a local Tailscale relay with `ibkr.allow_tailnet_relay: true`).
-2. Copy `config/desk_rules.live.example.yaml`, set your non-`DU` live `account_id`, set `execution_mode: live`, and set `ibkr.allow_live: true`.
-3. Export the second key in the execution environment only: `export CLEARFILLS_ALLOW_LIVE=1`.
-4. Validate fail-closed before connecting:
-   ```bash
-   CLEARFILLS_ALLOW_LIVE=1 clearfills-desk validate --config config/desk_rules.live.example.yaml
-   ```
-5. Every live order passes `clearfills-firewall` single-use Ed25519 `dispatch_check()` in Enforce mode before touching IBKR, submits parent + protective stop-loss bracket legs, and returns a sanitized `ExecutionReceipt` (zero account IDs).
+| Tool | What It Does |
+| :--- | :--- |
+| `get_portfolio` | Live NAV, settled USD/CAD cash, `accrued_interest_usd`, buying power, positions, open orders (masked account IDs). |
+| `get_quote` | Bid/ask/last/close/VWAP with `market_data_type`, `is_delayed`, and stale-close warnings. |
+| `preview_order` | Runs `clearfills-firewall` + IBKR `whatIfOrder` margin preview + Ed25519 attestation; auto-queues orders >= `human_confirm_above_usd` into ClearFills Cloud `Inbox`. |
+| `execute_attested_order` | Submits an attested limit/bracket order (blocks above `human_confirm_above_usd` without explicit confirmation). |
+| `execute_approved_order` | Verifies Cloud `status == "approved"` and matches symbol/side/qty before executing and posting the broker receipt back. |
+| `list_open_orders` | Lists active orders with protective stop-loss flags. |
+| `cancel_order` | Cancels an order while refusing to cancel protective stops unless `force_cancel_stop=true`. |
 
-> **Non-custodial software:** ClearFills Desk OS does not hold funds, execute managed capital, or provide investment advice. Plug in your own private strategies, LLM keys, and broker credentials.
+## Safety Invariants
+
+- **Paper vs. Live Hard Separation:** Paper requires port `4002`/`4004`/`7497` + `DU*` account; Live requires port `4001`/`7496` + non-`DU*` account + `ibkr.allow_live: true` + `CLEARFILLS_ALLOW_LIVE=1`.
+- **Host Guard:** Refuses public IPs — loopback (`127.0.0.1`) or Tailscale (`100.64.0.0/10` with `allow_tailnet_relay: true`) only.
+- **Multi-Agent Coexistence:** Automatically retries `clientId` collisions (`base_id` to `base_id + 5`) so Claude Code, Codex, and CLI commands can share one IB Gateway.
+- **Atomic Claim & 50 bps Slippage Guard (`watch`):** Claims approved orders atomically (`approved -> executing`), checks fresh live quotes within `max_slippage_bps`, mints a fresh Ed25519 attestation, and sends a 15-second worker heartbeat to `Inbox`.
+
+*Non-custodial execution software only. Not investment advice.*
