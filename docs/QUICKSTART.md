@@ -15,12 +15,12 @@ ClearFills is organized around **4 surfaces** matching how a human oversees auto
 
 1. Sign in at [https://clearfills.com/console](https://clearfills.com/console) with GitHub or Google.
 2. Click **Launch 60-Second Sandbox Demo** on `Portfolio`. This seeds a sample $1.2M Personal + Corporate balance sheet, activates a Corporate Treasury Sweep mandate, and queues an `SGOV` T-bill buy.
-3. Open **Inbox** and click **Approve & Execute** — sandbox orders execute instantaneously with an Ed25519 receipt and update **Lab → Verified Proof**.
+3. Open **Inbox** and click **Approve & Execute**. Sandbox orders execute immediately with an Ed25519 receipt and update **Lab → Verified Proof**.
 4. When ready to connect real accounts, click **Clear Sandbox Data** on `Portfolio`.
 
 ---
 
-## 2. Connect Your AI Agent (Remote MCP — Zero Install)
+## 2. Connect Your AI Agent (Remote MCP, Zero Install)
 
 Copy your API key from **Rules → API Keys** and add the hosted Streamable-HTTP MCP server (`https://clearfills-api.fly.dev/mcp`):
 
@@ -49,10 +49,10 @@ Ask your agent:
 ## 3. Sync Banks & Brokerages
 
 Open **Portfolio → + Connect Account**:
-- **MetaMask / EVM Wallets:** 1-click browser wallet connect (Ethereum, Base, Arbitrum, Optimism, Polygon — read-only, zero private keys).
+- **MetaMask / EVM Wallets:** 1-click browser wallet connect (Ethereum, Base, Arbitrum, Optimism, Polygon; read-only, zero private keys).
 - **Questrade / Wealthsimple / SnapTrade:** Official OAuth read-only portfolio sync.
 - **Interactive Brokers (IBKR):** Zero-password Gateway login (loopback or Tailscale) + `clearfills-desk sync ibkr`.
-- **Any Bank Globally (RBC, Tangerine, TD, Chase, Amex, etc.):** Let your own AI agent read open bank tabs or PDF statements, mask account numbers to the last 3 digits, and call `sync_account_snapshot` via MCP.
+- **Any Bank Globally (Chase, Mercury, TD, Amex, etc.):** Let your own AI agent read open bank tabs or PDF statements, mask account numbers to the last 3 digits, and call `sync_account_snapshot` via MCP.
 
 ---
 
@@ -75,4 +75,4 @@ Open **Portfolio → + Connect Account**:
 
 ## 5. Emergency Stop
 
-Click **Trip** on the **Kill-Switch** in **Rules** (or call `trip_kill_switch`) at any time. All sleeves — including `cash_equivalent` and `core_index` — immediately fail closed until you explicitly **Re-arm**.
+Click **Trip** on the **Kill-Switch** in **Rules** (or call `trip_kill_switch`) at any time. All sleeves (including `cash_equivalent` and `core_index`) immediately fail closed until you explicitly **Re-arm**.

@@ -42,7 +42,7 @@ Attach `clearfills-desk-mcp` to Claude Code, Codex, or Cursor:
 ## Safety Invariants
 
 - **Paper vs. Live Hard Separation:** Paper requires port `4002`/`4004`/`7497` + `DU*` account; Live requires port `4001`/`7496` + non-`DU*` account + `ibkr.allow_live: true` + `CLEARFILLS_ALLOW_LIVE=1`.
-- **Host Guard:** Refuses public IPs — loopback (`127.0.0.1`) or Tailscale (`100.64.0.0/10` with `allow_tailnet_relay: true`) only.
+- **Host Guard:** Refuses public IPs. Allows loopback (`127.0.0.1`) or Tailscale (`100.64.0.0/10` with `allow_tailnet_relay: true`) only.
 - **Multi-Agent Coexistence:** Automatically retries `clientId` collisions (`base_id` to `base_id + 5`) so Claude Code, Codex, and CLI commands can share one IB Gateway.
 - **Atomic Claim & 50 bps Slippage Guard (`watch`):** Claims approved orders atomically (`approved -> executing`), checks fresh live quotes within `max_slippage_bps`, mints a fresh Ed25519 attestation, and sends a 15-second worker heartbeat to `Inbox`.
 

@@ -5,9 +5,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Website](https://img.shields.io/badge/site-clearfills.com-090B10.svg)](https://clearfills.com)
 
-**Give AI a seat at your portfolio — without giving it your broker password.**
+**Let AI manage your portfolio without your broker password.**
 
-ClearFills is an open-core **Agentic Wealth & Execution OS**. Connect any frontier agent you already pay for (Claude Code, Codex, Cursor, Windsurf, OpenClaw) via MCP to unify Personal + Corporate net worth across banks and brokerages, enforce deterministic Ed25519 pre-trade risk rules, run scheduled standing mandates, and execute safely on 1-tap human approval.
+ClearFills is an open-core execution and wealth layer for AI agents. Connect Claude Code, Codex, Cursor, Windsurf, or OpenClaw over MCP to unify Personal + Corporate net worth across banks and brokerages, enforce deterministic Ed25519 pre-trade risk rules, run scheduled standing mandates, and execute on 1-tap human approval.
 
 - **Web Console (`Portfolio · Inbox · Rules · Lab`):** [https://clearfills.com/console](https://clearfills.com/console) *(60-second sandbox demo, $0)*
 - **Hosted Remote MCP (zero install):** `https://clearfills-api.fly.dev/mcp`
@@ -20,7 +20,7 @@ ClearFills is an open-core **Agentic Wealth & Execution OS**. Connect any fronti
 
 ```text
 Claude / Codex / Cursor / Standing Mandates
-                 │  (MCP — zero broker passwords)
+                 │  (MCP, zero broker passwords)
                  ▼
       ClearFills Cloud & Risk Firewall
    ┌─────────────────────────────────────┐
@@ -102,9 +102,9 @@ Every decision (`APPROVED`, `VETO`, `NONCE_ALREADY_SPENT`, `KILL_SWITCH_TRIPPED`
 
 ## Repository Layout
 
-- [`packages/risk-firewall`](packages/risk-firewall/) — Apache-2.0 `clearfills-firewall` (`v0.4.0` on PyPI): deterministic policy engine, per-sleeve rules, Ed25519 attestation authority, SHA-256 audit ledger, MCP stdio & FastAPI server.
-- [`packages/clearfills-desk`](packages/clearfills-desk/) — Apache-2.0 `clearfills-desk`: IBKR execution adapter (`whatIf` previews, delayed-quote metadata, multi-agent `clientId` retry), `clearfills-desk-mcp`, `clearfills-desk sync`, and `clearfills-desk watch`.
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — Concise operator guide covering Portfolio, Inbox, Rules, Lab, and live IBKR setup.
+- [`packages/risk-firewall`](packages/risk-firewall/): Apache-2.0 `clearfills-firewall` (`v0.4.0` on PyPI), deterministic policy engine, per-sleeve rules, Ed25519 attestation authority, SHA-256 audit ledger, MCP stdio & FastAPI server.
+- [`packages/clearfills-desk`](packages/clearfills-desk/): Apache-2.0 `clearfills-desk`, IBKR execution adapter (`whatIf` previews, delayed-quote metadata, multi-agent `clientId` retry), `clearfills-desk-mcp`, `clearfills-desk sync`, and `clearfills-desk watch`.
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md): Concise operator guide covering Portfolio, Inbox, Rules, Lab, and live IBKR setup.
 
 ---
 
@@ -112,4 +112,4 @@ Every decision (`APPROVED`, `VETO`, `NONCE_ALREADY_SPENT`, `KILL_SWITCH_TRIPPED`
 
 - **Zero credential custody:** AI agents never receive brokerage or banking passwords.
 - **Fail-closed live execution:** Live IBKR requires both `ibkr.allow_live: true` in config and `CLEARFILLS_ALLOW_LIVE=1` in the execution environment, loopback/Tailscale-only transport, and a 50 bps fresh-quote slippage guard on `clearfills-desk watch`.
-- **Software only:** ClearFills is self-directed risk engineering and execution software — not an investment advisor, custodian, or broker-dealer.
+- **Software only:** ClearFills is self-directed risk engineering and execution software, not an investment advisor, custodian, or broker-dealer.
