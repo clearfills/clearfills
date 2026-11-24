@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/clearfills-firewall.svg)](https://pypi.org/project/clearfills-firewall/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Website](https://img.shields.io/badge/site-clearfills.com-090B10.svg)](https://clearfills.com)
+[![Glama MCP Server](https://glama.ai/mcp/servers/clearfills/clearfills/badge)](https://glama.ai/mcp/servers/clearfills/clearfills)
 
 **Let AI manage your portfolio. Never give it your broker password.**
 
