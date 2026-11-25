@@ -30,7 +30,7 @@ jobs:
         run: |
           uv sync --extra dev
           uv pip install -e ../risk-firewall
-          uv run pytest -v
+          uv run --no-sync pytest -v
       - name: Build & verify unified clearfills wheel
         run: |
           uv build
