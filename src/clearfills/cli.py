@@ -1,4 +1,4 @@
-"""Unified CLI for ClearFills (`clearfills init|doctor|mcp|watch|sync|validate|redteam|serve|prove|verify-proof`)."""
+"""Unified CLI for ClearFills (`clearfills init|doctor|mcp|watch|sync|validate|redteam|benchmark|compile-policy|serve|prove|verify-proof`)."""
 
 from __future__ import annotations
 
@@ -1120,6 +1120,80 @@ def _cmd_verify_proof(args: argparse.Namespace) -> int:
     return 0 if report.get("valid") else 1
 
 
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    from clearfills_firewall import run_safety_benchmark
+
+    report = run_safety_benchmark()
+    all_ok = (
+        report.attacks_blocked == report.attacks_total
+        and report.legit_approved == report.legit_total
+        and report.audit_chain_valid
+    )
+
+    if args.json:
+        print(json.dumps(report.model_dump(mode="json"), indent=2))
+        return 0 if all_ok else 1
+
+    print(f"ClearFills 25-Scenario Adversarial Safety Benchmark (v{__version__})")
+    print("-" * 108)
+    print(f"  {'ID':<6s} {'STATUS':<6s} {'OUTCOME':<9s} {'LAT(ms)':>8s}  {'SCENARIO':<42s} {'REASON CODES'}")
+    print("-" * 108)
+    for r in report.results:
+        tag = _fmt_status("PASS" if r.passed else "FAIL")
+        codes = ", ".join(r.reason_codes) if r.reason_codes else "APPROVED"
+        print(
+            f"  {r.scenario_id:<6s} {tag} {r.actual_outcome:<9s} {r.latency_ms:>8.3f}  {r.name:<42s} {codes}"
+        )
+    print("-" * 108)
+    print(
+        f"  Attacks blocked: {report.attacks_blocked}/{report.attacks_total} ({report.block_rate_pct:.1f}%)"
+        f" | Legit approved: {report.legit_approved}/{report.legit_total} ({report.false_positive_rate_pct:.1f}% false positives)"
+    )
+    print(
+        f"  Latency:         avg {report.avg_latency_ms:.3f} ms | p99 {report.p99_latency_ms:.3f} ms"
+        f" | Audit chain: {'VALID' if report.audit_chain_valid else 'INVALID'} ({report.audit_entry_count} SHA-256 entries)"
+    )
+    return 0 if all_ok else 1
+
+
+def _cmd_compile_policy(args: argparse.Namespace) -> int:
+    from clearfills_firewall import compile_natural_language_policy
+
+    result = compile_natural_language_policy(args.rules)
+
+    if args.output is not None:
+        out_path: Path = args.output
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(result.yaml_text, encoding="utf-8")
+
+    if args.json:
+        payload = result.model_dump(mode="json")
+        if args.output is not None:
+            payload["output_path"] = str(args.output)
+        print(json.dumps(payload, indent=2))
+        return 0 if result.self_test_passed else 1
+
+    print(f"ClearFills Deterministic Policy Compiler (v{__version__})")
+    print("-" * 76)
+    print(f"  Extracted rules ({len(result.extracted_rules)}):")
+    for rule in result.extracted_rules:
+        print(f"    - {rule.field}: {rule.value!r} ({rule.description})")
+    if result.warnings:
+        print("  Warnings:")
+        for w in result.warnings:
+            print(f"    ! {w}")
+    status_tag = _fmt_status("PASS" if result.self_test_passed else "FAIL")
+    print(f"  Self-test: {status_tag} {result.self_test_summary}")
+    for chk in result.self_test_checks:
+        chk_tag = _fmt_status("PASS" if chk.passed else "FAIL")
+        print(f"    {chk_tag} {chk.rule:<26s} expected={chk.expected} actual={chk.actual}")
+    if args.output is not None:
+        print(f"  Saved YAML: {args.output}")
+    print("-" * 76)
+    print(result.yaml_text.rstrip())
+    return 0 if result.self_test_passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clearfills",
@@ -1173,6 +1247,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_rt = sub.add_parser("redteam", help="Run a 3-step live or offline firewall & replay-protection check.")
     p_rt.add_argument("--local", action="store_true", help="Run 100%% offline against local FirewallService.")
     p_rt.add_argument("--url", default=DEFAULT_CHALLENGE_MCP_URL, help=f"Public MCP challenge URL (default: {DEFAULT_CHALLENGE_MCP_URL}).")
+
+    # benchmark
+    p_bench = sub.add_parser(
+        "benchmark",
+        help="Run the 25-scenario adversarial safety benchmark against the local FirewallService.",
+    )
+    p_bench.add_argument("--json", action="store_true", help="Output structured JSON report.")
+
+    # compile-policy
+    p_cp = sub.add_parser(
+        "compile-policy",
+        help="Deterministically compile plain-English risk rules into a verified RiskPolicy YAML.",
+    )
+    p_cp.add_argument("rules", help="Plain-English trading and risk constraints to compile.")
+    p_cp.add_argument("--json", action="store_true", help="Output structured JSON result.")
+    p_cp.add_argument("--output", type=Path, default=None, help="Optional path to write compiled policy YAML.")
 
     # serve
     p_srv = sub.add_parser("serve", help="Start the local FastAPI HTTP firewall server (requires clearfills[server]).")
@@ -1239,6 +1329,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_validate(args)
     if args.command == "redteam":
         return _cmd_redteam(args)
+    if args.command == "benchmark":
+        return _cmd_benchmark(args)
+    if args.command == "compile-policy":
+        return _cmd_compile_policy(args)
     if args.command == "serve":
         return _cmd_serve(args)
     if args.command == "prove":
