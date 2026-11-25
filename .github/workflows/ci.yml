@@ -29,6 +29,7 @@ jobs:
         working-directory: packages/clearfills-desk
         run: |
           uv sync --extra dev
+          uv pip install -e ../risk-firewall
           uv run pytest -v
       - name: Build & verify unified clearfills wheel
         run: |
