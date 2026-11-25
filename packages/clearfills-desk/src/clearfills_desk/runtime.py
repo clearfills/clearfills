@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clearfills_firewall import (
     FirewallService,
@@ -16,6 +16,8 @@ from clearfills_firewall import (
     SignedAttestation,
     TradeProposal,
 )
+
+from .enclave_client import RemoteEnclaveFirewallClient, TransportCallable
 
 DESK_ROLES: dict[str, str] = {
     "researcher": "Gathers filings, catalysts, and market data (read-only, zero broker keys).",
@@ -48,8 +50,29 @@ class DeskConfig(BaseModel):
     execution_mode: Literal["paper", "live", "shadow", "enforce"] = "paper"
     venue: str = "ibkr"
     human_confirm_above_usd: float = Field(default=25_000.0, ge=0.0)
+    remote_signer_endpoint: str | None = None
+    operator_passkey_spki_b64: list[str] = Field(default_factory=list)
     ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
     risk: RiskPolicy = Field(default_factory=RiskPolicy)
+
+    @field_validator("remote_signer_endpoint")
+    @classmethod
+    def _validate_remote_signer_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not cleaned.startswith(("unix://", "http://", "https://")):
+            raise ValueError(
+                "remote_signer_endpoint must start with 'unix://', 'http://', or 'https://'."
+            )
+        return cleaned
+
+    @field_validator("operator_passkey_spki_b64")
+    @classmethod
+    def _normalize_operator_passkeys(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "DeskConfig":
@@ -62,16 +85,36 @@ class DeskConfig(BaseModel):
 class DeskRuntime:
     """Thin multi-agent desk orchestrator delegating all risk enforcement to clearfills-firewall."""
 
-    def __init__(self, config: DeskConfig, state_dir: str | Path) -> None:
+    def __init__(
+        self,
+        config: DeskConfig,
+        state_dir: str | Path,
+        *,
+        enclave_client: RemoteEnclaveFirewallClient | None = None,
+        enclave_transport: TransportCallable | None = None,
+    ) -> None:
         self.config = config
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.firewall = FirewallService.from_data_dir(
-            data_dir=self.state_dir / "firewall",
-            policy=config.risk,
-            initialize_armed=True,
-            ttl_seconds=120,
-        )
+        self.enclave_client: RemoteEnclaveFirewallClient | None = None
+        self.firewall: FirewallService | RemoteEnclaveFirewallClient
+
+        if enclave_client is not None:
+            self.enclave_client = enclave_client
+            self.firewall = enclave_client
+        elif config.remote_signer_endpoint:
+            self.enclave_client = RemoteEnclaveFirewallClient(
+                config.remote_signer_endpoint,
+                transport=enclave_transport,
+            )
+            self.firewall = self.enclave_client
+        else:
+            self.firewall = FirewallService.from_data_dir(
+                data_dir=self.state_dir / "firewall",
+                policy=config.risk,
+                initialize_armed=True,
+                ttl_seconds=120,
+            )
 
     def evaluate_proposal(
         self,

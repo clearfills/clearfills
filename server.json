@@ -3,7 +3,7 @@
   "name": "com.clearfills/clearfills",
   "title": "ClearFills",
   "description": "Deterministic pre-trade risk firewall and portfolio MCP server for AI agents (IBKR, Alpaca).",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "websiteUrl": "https://clearfills.com",
   "repository": {
     "url": "https://github.com/clearfills/clearfills",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "clearfills",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "transport": {
         "type": "stdio"
       }

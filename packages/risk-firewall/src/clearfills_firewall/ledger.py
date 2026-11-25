@@ -174,8 +174,22 @@ class AuditLedger:
     def _get_tail_state(self) -> tuple[int, str]:
         if not self._path.exists():
             return 0, GENESIS_HASH
-        lines = [ln for ln in self._path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if not lines:
+        size = self._path.stat().st_size
+        if size == 0:
             return 0, GENESIS_HASH
-        last = AuditEntry.model_validate_json(lines[-1])
-        return last.seq, last.entry_hash
+        with self._path.open("rb") as fh:
+            chunk_size = 8192
+            pos = size
+            buf = b""
+            while pos > 0:
+                read_len = min(chunk_size, pos)
+                pos -= read_len
+                fh.seek(pos)
+                buf = fh.read(read_len) + buf
+                lines = [ln for ln in buf.splitlines() if ln.strip()]
+                if len(lines) >= 2 or pos == 0:
+                    if not lines:
+                        return 0, GENESIS_HASH
+                    last = AuditEntry.model_validate_json(lines[-1].decode("utf-8"))
+                    return last.seq, last.entry_hash
+        return 0, GENESIS_HASH

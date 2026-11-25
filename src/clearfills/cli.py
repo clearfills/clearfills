@@ -481,7 +481,11 @@ def _redteam_local() -> int:
             stop_price=None,
         )
         d1 = svc.propose(p1, portfolio)
-        c1_ok = (not d1.approved) and ("MISSING_STOP_LOSS" in d1.reason_codes or "MAX_ORDER_NOTIONAL_EXCEEDED" in d1.reason_codes)
+        c1_ok = (
+            (not d1.approved)
+            and ("MARKET_ORDER_FORBIDDEN" in d1.reason_codes)
+            and ("MISSING_STOP_LOSS" in d1.reason_codes or "MAX_ORDER_NOTIONAL_EXCEEDED" in d1.reason_codes)
+        )
         print(
             f"  {_fmt_status('PASS' if c1_ok else 'FAIL')} 1. Rogue 50,000 NVDA MARKET   "
             f"-> {d1.status.value} {d1.reason_codes}"

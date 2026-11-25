@@ -39,6 +39,30 @@ PAPER_PREFIX = "DU"
 LIVE_ENV_FLAG = "CLEARFILLS_ALLOW_LIVE"
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _STOP_ORDER_TYPES: frozenset[str] = frozenset({"STP", "STP LMT", "TRAIL", "TRAIL LIMIT"})
+_CAD_TSX_SYMBOLS: frozenset[str] = frozenset(
+    {"CBIL", "VEQT", "VBAL", "XEQT", "VGRO", "ZAG", "XIC", "VFV", "CASH", "PSA", "HSAV"}
+)
+
+
+def _resolve_stock_contract_spec(
+    symbol: str,
+    *,
+    exchange: str = "SMART",
+    currency: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve IBKR Stock `(base_symbol, exchange, currency)` including TSX `.TO` & CAD ETFs."""
+    raw_sym = symbol.strip().upper()
+    exch = exchange.strip().upper() if exchange and exchange.strip() else "SMART"
+    norm_ccy = currency.strip().upper() if currency and currency.strip() else None
+    if raw_sym.endswith(".TO"):
+        base_sym = raw_sym[:-3].strip()
+        resolved_ccy = norm_ccy if (norm_ccy is not None and norm_ccy != "USD") else "CAD"
+        return base_sym, exch, resolved_ccy
+    if norm_ccy is None:
+        resolved_ccy = "CAD" if raw_sym in _CAD_TSX_SYMBOLS else "USD"
+    else:
+        resolved_ccy = norm_ccy
+    return raw_sym, exch, resolved_ccy
 
 
 def mask_account_id(account_id: str) -> str:
@@ -268,12 +292,27 @@ class IBKRExecutionAdapter:
         if self._ib is not None and self._ib.isConnected():
             self._ib.disconnect()
 
-    def _build_stock_contract(self, symbol: str, *, exchange: str = "SMART", currency: str = "USD") -> Any:
+    def _build_stock_contract(
+        self,
+        symbol: str,
+        *,
+        exchange: str = "SMART",
+        currency: str | None = None,
+    ) -> Any:
+        base_symbol, resolved_exchange, resolved_currency = _resolve_stock_contract_spec(
+            symbol,
+            exchange=exchange,
+            currency=currency,
+        )
         try:
             from ib_async import Stock  # type: ignore[import-not-found]
-            return Stock(symbol.strip().upper(), exchange, currency)
+            return Stock(base_symbol, resolved_exchange, resolved_currency)
         except ImportError:
-            return {"symbol": symbol.strip().upper(), "exchange": exchange, "currency": currency}
+            return {
+                "symbol": base_symbol,
+                "exchange": resolved_exchange,
+                "currency": resolved_currency,
+            }
 
     def list_open_orders(self) -> list[dict[str, Any]]:
         """List open orders sanitized of raw account IDs."""
@@ -392,17 +431,39 @@ class IBKRExecutionAdapter:
     def build_portfolio_snapshot(self, portfolio_data: dict[str, Any] | None = None) -> PortfolioSnapshot:
         """Convert sanitized `get_portfolio()` output into a `PortfolioSnapshot` for firewall evaluation."""
         data = portfolio_data if portfolio_data is not None else self.get_portfolio()
-        open_positions = [
-            Position(
-                symbol=str(p["symbol"]).upper(),
-                quantity=float(p["quantity"]),
-                avg_entry_price=max(0.0001, float(p.get("avg_cost") or p.get("market_price") or 1.0)),
-                current_price=max(0.0001, float(p.get("market_price") or p.get("avg_cost") or 1.0)),
-                venue="ibkr",
+        open_orders = data.get("open_orders") or []
+        open_positions: list[Position] = []
+        for p in data.get("positions", []):
+            qty = float(p.get("quantity", 0.0))
+            if qty == 0.0:
+                continue
+            sym = str(p["symbol"]).strip().upper()
+            stop_price = _safe_float(p.get("stop_price"), 0.0) or None
+            if stop_price is None or stop_price <= 0.0:
+                stop_price = None
+                expected_action = "SELL" if qty > 0 else "BUY"
+                for o in open_orders:
+                    if not isinstance(o, dict):
+                        continue
+                    if (
+                        str(o.get("symbol") or "").strip().upper() == sym
+                        and bool(o.get("is_protective_stop"))
+                        and str(o.get("action") or "").strip().upper() == expected_action
+                    ):
+                        aux = _safe_float(o.get("aux_price"), 0.0)
+                        if aux > 0.0:
+                            stop_price = aux
+                            break
+            open_positions.append(
+                Position(
+                    symbol=sym,
+                    quantity=qty,
+                    avg_entry_price=max(0.0001, abs(float(p.get("avg_cost") or p.get("market_price") or 1.0))),
+                    current_price=max(0.0001, abs(float(p.get("market_price") or p.get("avg_cost") or 1.0))),
+                    stop_price=stop_price,
+                    venue="ibkr",
+                )
             )
-            for p in data.get("positions", [])
-            if float(p.get("quantity", 0.0)) > 0
-        ]
         nav = max(1.0, float(data.get("nav_usd") or 1.0))
         cash = max(0.0, float(data.get("settled_cash_usd") or 0.0))
         return PortfolioSnapshot(
@@ -413,11 +474,26 @@ class IBKRExecutionAdapter:
             open_positions=open_positions,
         )
 
-    def get_quote(self, symbol: str, *, exchange: str = "SMART", currency: str = "USD") -> dict[str, Any]:
+    def get_quote(
+        self,
+        symbol: str,
+        *,
+        exchange: str = "SMART",
+        currency: str | None = None,
+    ) -> dict[str, Any]:
         """Fetch live snapshot bid/ask/last/VWAP quote from IBKR Gateway."""
         self.connect(readonly=True)
         ib = self._get_client()
-        contract = self._build_stock_contract(symbol, exchange=exchange, currency=currency)
+        base_symbol, resolved_exchange, resolved_currency = _resolve_stock_contract_spec(
+            symbol,
+            exchange=exchange,
+            currency=currency,
+        )
+        contract = self._build_stock_contract(
+            base_symbol,
+            exchange=resolved_exchange,
+            currency=resolved_currency,
+        )
         qualified = ib.qualifyContracts(contract)
         if qualified:
             contract = qualified[0]
@@ -455,9 +531,9 @@ class IBKRExecutionAdapter:
             )
 
         return {
-            "symbol": symbol.strip().upper(),
-            "exchange": exchange,
-            "currency": currency,
+            "symbol": base_symbol,
+            "exchange": resolved_exchange,
+            "currency": resolved_currency,
             "bid": bid if bid > 0 else None,
             "ask": ask if ask > 0 else None,
             "last": last if last > 0 else None,
@@ -539,6 +615,26 @@ class IBKRExecutionAdapter:
             "was_protective_stop": is_stop,
         }
 
+    def _validate_proposal_order_type(self, proposal: TradeProposal) -> None:
+        base_symbol, _, _ = _resolve_stock_contract_spec(proposal.symbol)
+        risk_policy = self.runtime.config.risk
+        _, sleeve = risk_policy.resolve_sleeve(proposal.symbol)
+        if sleeve is None and base_symbol != proposal.symbol.strip().upper():
+            _, sleeve = risk_policy.resolve_sleeve(base_symbol)
+        allow_market_orders = (
+            sleeve.allow_market_orders
+            if (sleeve is not None and sleeve.allow_market_orders is not None)
+            else risk_policy.allow_market_orders
+        )
+        if proposal.order_type != OrderType.LIMIT:
+            if not allow_market_orders or proposal.order_type != OrderType.MARKET:
+                raise LiveExecutionSafetyError(
+                    f"Refusing non-LIMIT order ({proposal.order_type.value}) for {proposal.symbol}: "
+                    "LIMIT orders are required unless allow_market_orders=True."
+                )
+        elif proposal.limit_price is None or proposal.limit_price <= 0:
+            raise LiveExecutionSafetyError("LIMIT order requires a positive limit_price.")
+
     def _build_contract_and_orders(
         self,
         proposal: TradeProposal,
@@ -546,11 +642,18 @@ class IBKRExecutionAdapter:
         attestation_id: str,
     ) -> tuple[Any, list[Any]]:
         """Build IBKR Stock contract + parent/stop/target order objects."""
+        self._validate_proposal_order_type(proposal)
+        base_symbol, resolved_exchange, resolved_currency = _resolve_stock_contract_spec(proposal.symbol)
+
         try:
             from ib_async import LimitOrder, MarketOrder, Order, Stock  # type: ignore[import-not-found]
         except ImportError:
             # Lightweight fallback dicts for unit-testing with injected mock clients
-            contract = {"symbol": proposal.symbol.upper(), "exchange": "SMART", "currency": "USD"}
+            contract = {
+                "symbol": base_symbol,
+                "exchange": resolved_exchange,
+                "currency": resolved_currency,
+            }
             parent = {
                 "account": account,
                 "action": proposal.side.value,
@@ -589,14 +692,13 @@ class IBKRExecutionAdapter:
                 )
             return contract, orders
 
-        contract = Stock(proposal.symbol.upper(), "SMART", "USD")
+        contract = Stock(base_symbol, resolved_exchange, resolved_currency)
         action = proposal.side.value
         exit_action = "SELL" if proposal.side == Side.BUY else "BUY"
         has_children = proposal.stop_price is not None or proposal.target_price is not None
 
         if proposal.order_type == OrderType.LIMIT:
-            if proposal.limit_price is None:
-                raise LiveExecutionSafetyError("LIMIT order requires limit_price.")
+            assert proposal.limit_price is not None and proposal.limit_price > 0
             parent = LimitOrder(action, proposal.quantity, proposal.limit_price)
         else:
             parent = MarketOrder(action, proposal.quantity)
@@ -633,6 +735,9 @@ class IBKRExecutionAdapter:
         attestation: SignedAttestation,
     ) -> ExecutionReceipt:
         """Verify Ed25519 single-use attestation and route the order to IBKR (Paper or Live)."""
+        # 0. Fail-closed order-type & limit-price safety guard
+        self._validate_proposal_order_type(proposal)
+
         # 1. Fail-closed cryptographic attestation check (single-use, 120s TTL, exact binding)
         if not self.runtime.verify_dispatch(attestation=attestation, proposal=proposal):
             raise LiveExecutionSafetyError(

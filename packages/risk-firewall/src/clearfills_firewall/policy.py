@@ -14,6 +14,7 @@ _ET = ZoneInfo("America/New_York")
 from .killswitch import KillSwitch
 from .models import (
     DecisionStatus,
+    OrderType,
     PortfolioSnapshot,
     RiskDecision,
     Side,
@@ -41,6 +42,8 @@ class SleevePolicy(BaseModel):
     exempt_last_session_of_week: bool = Field(default=False)
     exempt_session_cutoff: bool = Field(default=False)
     allow_shorting: Optional[bool] = None
+    allow_market_orders: Optional[bool] = None
+    allow_margin: Optional[bool] = None
 
 
 def default_allocation_sleeves() -> dict[str, SleevePolicy]:
@@ -82,14 +85,37 @@ class RiskPolicy(BaseModel):
     )
     blocked_symbols: list[str] = Field(default_factory=list)
     allow_shorting: bool = Field(default=False)
+    allow_market_orders: bool = Field(default=False)
+    allow_margin: bool = Field(default=False)
     max_prediction_market_exposure_pct: float = Field(default=15.0, ge=0.0, le=100.0)
     fractional_kelly_multiplier: float = Field(default=0.25, gt=0.0, le=1.0)
+    max_kelly_confidence: float = Field(default=0.75, gt=0.0, le=1.0)
     enforce_kelly_sizing: bool = Field(default=True)
     max_entries_per_session: Optional[int] = Field(default=None, ge=1)
     block_last_session_of_week: bool = Field(default=False)
     no_entries_after_et: Optional[str] = Field(default=None)
     max_gross_exposure_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
     sleeves: dict[str, SleevePolicy] = Field(default_factory=dict)
+    is_us_tax_person: bool = Field(default=False)
+    pfic_symbols: list[str] = Field(
+        default_factory=lambda: [
+            "VEQT",
+            "XEQT",
+            "VBAL",
+            "VGRO",
+            "CBIL",
+            "CASH",
+            "PSA",
+            "HSAV",
+            "ZAG",
+            "XIC",
+            "VFV",
+            "XIU",
+            "DLR",
+        ]
+    )
+    recent_loss_sale_symbols: list[str] = Field(default_factory=list)
+    insider_blackout_windows: list[dict[str, str]] = Field(default_factory=list)
 
     def resolve_sleeve(self, symbol: str) -> tuple[str, Optional[SleevePolicy]]:
         """Return (sleeve_name, SleevePolicy) matching symbol, or ('active_trading', None)."""
@@ -122,6 +148,27 @@ def _is_prediction_market(proposal: TradeProposal) -> bool:
         proposal.venue_type == VenueType.PREDICTION_MARKET
         or proposal.venue.lower() in {"polymarket", "kalshi"}
     )
+
+
+def _compute_effective_portfolio_heat_pct(
+    portfolio: PortfolioSnapshot,
+    policy: RiskPolicy,
+) -> float:
+    """Compute portfolio stop-loss heat while respecting stop-exempt sleeves (e.g. SGOV/VOO)."""
+    total_risk_usd = 0.0
+    for pos in portfolio.open_positions:
+        if pos.quantity == 0:
+            continue
+        if pos.stop_price is not None:
+            total_risk_usd += abs(pos.current_price - pos.stop_price) * abs(pos.quantity)
+        elif pos.venue_type == VenueType.PREDICTION_MARKET or pos.venue in {"polymarket", "kalshi"}:
+            total_risk_usd += abs(pos.quantity) * pos.current_price
+        else:
+            _, pos_sleeve = policy.resolve_sleeve(pos.symbol)
+            if pos_sleeve is not None and pos_sleeve.require_stop_loss is False:
+                continue
+            total_risk_usd += pos.market_value_usd * 0.10
+    return (total_risk_usd / portfolio.nav_usd) * 100.0
 
 
 def evaluate_proposal(
@@ -166,9 +213,21 @@ def evaluate_proposal(
         if (sleeve is not None and sleeve.allow_shorting is not None)
         else policy.allow_shorting
     )
+    eff_allow_market_orders = (
+        sleeve.allow_market_orders
+        if (sleeve is not None and sleeve.allow_market_orders is not None)
+        else policy.allow_market_orders
+    )
+    eff_allow_margin = (
+        sleeve.allow_margin
+        if (sleeve is not None and sleeve.allow_margin is not None)
+        else policy.allow_margin
+    )
     exempt_entry_cap = bool(sleeve is not None and sleeve.exempt_session_entry_cap)
     exempt_last_session = bool(sleeve is not None and sleeve.exempt_last_session_of_week)
     exempt_cutoff = bool(sleeve is not None and sleeve.exempt_session_cutoff)
+
+    effective_heat_pct = _compute_effective_portfolio_heat_pct(portfolio, policy)
 
     reason_codes: list[str] = []
     reasons: list[str] = []
@@ -179,7 +238,8 @@ def evaluate_proposal(
         "cash_usd": portfolio.cash_usd,
         "open_position_count": portfolio.open_position_count,
         "daily_loss_pct": round(portfolio.daily_loss_pct, 4),
-        "current_heat_pct": round(portfolio.current_heat_pct, 4),
+        "current_heat_pct": round(effective_heat_pct, 4),
+        "raw_portfolio_heat_pct": round(portfolio.current_heat_pct, 4),
     }
 
     def add_veto(code: str, message: str) -> None:
@@ -206,11 +266,53 @@ def evaluate_proposal(
         )
 
     # 3. Blocked symbol check
+    prop_sym = proposal.symbol.strip().upper()
     blocked_symbols = {s.strip().upper() for s in policy.blocked_symbols}
-    if proposal.symbol.upper() in blocked_symbols:
+    if prop_sym in blocked_symbols:
         add_veto(
             "SYMBOL_BLOCKED",
             f"Symbol '{proposal.symbol}' is explicitly blocked by policy",
+        )
+
+    # 3a. Cross-border US PFIC hard veto (IRS Form 8621)
+    if policy.is_us_tax_person and proposal.side == Side.BUY:
+        pfic_symbols = {s.strip().upper() for s in policy.pfic_symbols}
+        if prop_sym in pfic_symbols or prop_sym.endswith(".TO"):
+            add_veto(
+                "PFIC_FORBIDDEN_FOR_US_PERSON",
+                f"Symbol '{proposal.symbol}' is a non-US pooled fund/ETF and triggers punitive IRS Form 8621 PFIC taxation for US tax persons outside qualified retirement accounts",
+            )
+
+    # 3b-tax. IRS 30-day wash-sale / CRA superficial-loss hard veto
+    if proposal.side == Side.BUY and policy.recent_loss_sale_symbols:
+        recent_loss_symbols = {s.strip().upper() for s in policy.recent_loss_sale_symbols}
+        if prop_sym in recent_loss_symbols:
+            add_veto(
+                "SUPERFICIAL_LOSS_BLOCKED",
+                f"Buying identical security '{proposal.symbol}' within ±30 days of a realized loss sale across affiliated entities disallows the harvested capital loss under IRS wash-sale / CRA superficial-loss rules",
+            )
+
+    # 3c-compliance. Corporate insider / MNPI trading-window blackout veto (both BUY and SELL)
+    if policy.insider_blackout_windows:
+        eval_date = proposal.created_at.astimezone(_ET).date().isoformat()
+        for win in policy.insider_blackout_windows:
+            if not isinstance(win, dict):
+                continue
+            win_sym = str(win.get("symbol", "")).strip().upper()
+            start_date = str(win.get("start_date", "")).strip()
+            end_date = str(win.get("end_date", "")).strip()
+            if win_sym and win_sym == prop_sym and start_date and end_date and start_date <= eval_date <= end_date:
+                add_veto(
+                    "INSIDER_BLACKOUT_ACTIVE",
+                    f"Symbol '{proposal.symbol}' is in an active insider trading blackout window ({start_date} to {end_date} ET; eval_date={eval_date}); both BUY and SELL orders are prohibited",
+                )
+                break
+
+    # 3b. Order-type enforcement (LIMIT-only by default unless allow_market_orders=True)
+    if proposal.order_type != OrderType.LIMIT and not eff_allow_market_orders:
+        add_veto(
+            "MARKET_ORDER_FORBIDDEN",
+            f"Order type '{proposal.order_type.value}' is forbidden by policy; LIMIT orders are required unless allow_market_orders=True",
         )
 
     # 4. Shorting check
@@ -285,6 +387,14 @@ def evaluate_proposal(
                 f"Order notional ${order_notional_usd:,.2f} exceeds max_order_notional_usd ${eff_max_notional:,.2f} (sleeve={sleeve_name})",
             )
 
+        # 8a. Cash / buying-power check (unless margin explicitly permitted or reducing long exposure)
+        if proposal.side == Side.BUY and not is_reducing_position and not eff_allow_margin:
+            if order_notional_usd > portfolio.cash_usd + 1e-6:
+                add_veto(
+                    "INSUFFICIENT_CASH",
+                    f"BUY order notional ${order_notional_usd:,.2f} exceeds available cash_usd ${portfolio.cash_usd:,.2f} (allow_margin=False)",
+                )
+
         # 8b. Max gross exposure cap (for new/expanding positions)
         if eff_max_gross_pct is not None and not is_reducing_position:
             projected_gross_pct = ((portfolio.gross_exposure_usd + order_notional_usd) / portfolio.nav_usd) * 100.0
@@ -326,7 +436,7 @@ def evaluate_proposal(
             trade_risk_pct = (trade_risk_usd / portfolio.nav_usd) * 100.0
             max_risk_usd = portfolio.nav_usd * (eff_max_risk_pct / 100.0)
             max_qty_by_risk = max_risk_usd / stop_distance
-            projected_heat_pct = portfolio.current_heat_pct + trade_risk_pct
+            projected_heat_pct = effective_heat_pct + trade_risk_pct
 
             metrics["stop_distance"] = round(stop_distance, 6)
             metrics["trade_risk_usd"] = round(trade_risk_usd, 4)
@@ -362,13 +472,14 @@ def evaluate_proposal(
                 else:
                     reward_distance = abs(proposal.target_price - entry_price)
                     payoff_ratio = reward_distance / stop_distance  # b
-                    p = proposal.confidence
+                    p = min(proposal.confidence, policy.max_kelly_confidence)
                     q = 1.0 - p
                     full_kelly = (p * payoff_ratio - q) / payoff_ratio
                     fractional_kelly = max(0.0, full_kelly * policy.fractional_kelly_multiplier)
                     kelly_risk_cap_pct = fractional_kelly * 100.0
                     kelly_max_qty = (portfolio.nav_usd * fractional_kelly) / stop_distance
 
+                    metrics["effective_kelly_confidence"] = round(p, 4)
                     metrics["payoff_ratio"] = round(payoff_ratio, 4)
                     metrics["full_kelly_fraction"] = round(full_kelly, 4)
                     metrics["fractional_kelly_pct"] = round(kelly_risk_cap_pct, 4)

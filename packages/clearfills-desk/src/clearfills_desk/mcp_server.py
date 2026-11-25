@@ -50,9 +50,12 @@ BROKER_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": {"type": "string", "description": "Ticker symbol (e.g. SGOV, VT, GOOG, NVDA)."},
+                "symbol": {"type": "string", "description": "Ticker symbol (e.g. SGOV, CBIL, RY.TO, VT, GOOG, NVDA)."},
                 "exchange": {"type": "string", "default": "SMART"},
-                "currency": {"type": "string", "default": "USD"},
+                "currency": {
+                    "type": "string",
+                    "description": "Optional quote currency (auto-resolves CAD for TSX/.TO symbols, otherwise USD).",
+                },
             },
             "required": ["symbol"],
         },
@@ -311,8 +314,8 @@ class BrokerMCPServer:
                 return _tool_result(
                     self.adapter.get_quote(
                         symbol,
-                        exchange=str(arguments.get("exchange", "SMART")),
-                        currency=str(arguments.get("currency", "USD")),
+                        exchange=str(arguments.get("exchange") or "SMART"),
+                        currency=str(arguments["currency"]) if arguments.get("currency") else None,
                     )
                 )
 
