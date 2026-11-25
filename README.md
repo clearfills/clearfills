@@ -1,5 +1,7 @@
 # ClearFills
 
+<!-- mcp-name: com.clearfills/clearfills -->
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-10B981.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![PyPI](https://img.shields.io/pypi/v/clearfills.svg)](https://pypi.org/project/clearfills/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)

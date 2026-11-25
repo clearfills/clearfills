@@ -1,9 +1,9 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
-  "name": "com.clearfills/risk-firewall",
-  "title": "ClearFills Pre-Trade Risk Firewall",
-  "description": "Deterministic Ed25519 pre-trade risk firewall MCP server for AI trading agents across IBKR, Alpaca, Polymarket, and Kalshi.",
-  "version": "0.1.0",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.clearfills/clearfills",
+  "title": "ClearFills",
+  "description": "Deterministic pre-trade risk firewall and portfolio MCP server for AI agents (IBKR, Alpaca).",
+  "version": "0.5.1",
   "websiteUrl": "https://clearfills.com",
   "repository": {
     "url": "https://github.com/clearfills/clearfills",
@@ -12,11 +12,17 @@
   "packages": [
     {
       "registryType": "pypi",
-      "identifier": "clearfills-firewall",
-      "version": "0.1.0",
+      "identifier": "clearfills",
+      "version": "0.5.1",
       "transport": {
         "type": "stdio"
       }
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://clearfills-api.fly.dev/mcp"
     }
   ]
 }
