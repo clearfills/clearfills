@@ -8,6 +8,15 @@ from .custom_guards import (
     GuardViolation,
     evaluate_declarative_rule,
 )
+from .envelopes import (
+    EnvelopeEvaluator,
+    EnvelopeVerdict,
+    RiskProfilePreset,
+    StrategyEnvelope,
+    compute_envelope_signature_hash,
+    list_risk_profiles,
+    policy_from_profile,
+)
 from .killswitch import KillSwitch, KillSwitchState
 from .ledger import AuditLedger, GENESIS_HASH
 from .mcp_server import handle_jsonrpc_request, run_stdio_server
@@ -46,6 +55,8 @@ __all__ = [
     "CustomGuardFn",
     "DecisionStatus",
     "DeclarativeGuardRule",
+    "EnvelopeEvaluator",
+    "EnvelopeVerdict",
     "ExecutionReceipt",
     "ExtractedRule",
     "FirewallService",
@@ -58,14 +69,17 @@ __all__ = [
     "Position",
     "RiskDecision",
     "RiskPolicy",
+    "RiskProfilePreset",
     "SelfTestCheck",
     "Side",
     "SignedAttestation",
     "SleevePolicy",
+    "StrategyEnvelope",
     "TradeProposal",
     "VenueType",
     "canonical_order_hash",
     "compile_natural_language_policy",
+    "compute_envelope_signature_hash",
     "create_app",
     "default_allocation_sleeves",
     "evaluate_declarative_rule",
@@ -73,6 +87,8 @@ __all__ = [
     "from_ai_hedge_fund_signal",
     "from_tradingagents_decision",
     "handle_jsonrpc_request",
+    "list_risk_profiles",
+    "policy_from_profile",
     "run_safety_benchmark",
     "run_stdio_server",
 ]
