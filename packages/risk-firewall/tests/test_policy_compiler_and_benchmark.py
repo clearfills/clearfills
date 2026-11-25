@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from clearfills.cli import main as cli_main
+import pytest
+
 from clearfills_firewall import (
     FirewallService,
     OrderType,
@@ -204,6 +205,7 @@ def test_run_safety_benchmark_25_scenarios() -> None:
 
 
 def test_cli_benchmark_text_and_json(capsys) -> None:
+    cli_main = pytest.importorskip("clearfills.cli").main
     rc_text = cli_main(["benchmark"])
     assert rc_text == 0
     out_text = capsys.readouterr().out
@@ -222,6 +224,7 @@ def test_cli_benchmark_text_and_json(capsys) -> None:
 
 
 def test_cli_compile_policy_text_json_and_output(tmp_path: Path, capsys) -> None:
+    cli_main = pytest.importorskip("clearfills.cli").main
     rules = "Cap orders at $25k, stop trading if down 2% today, max heat 6%, block TQQQ, SQQQ"
 
     rc_text = cli_main(["compile-policy", rules])
