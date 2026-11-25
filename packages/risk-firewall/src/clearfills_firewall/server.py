@@ -12,9 +12,15 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 from .attestation import AttestationAuthority, canonical_order_hash
+from .custom_guards import (
+    CustomGuardFn,
+    DeclarativeGuardRule,
+    GuardViolation,
+    evaluate_declarative_rule,
+)
 from .killswitch import KillSwitch, KillSwitchState
 from .ledger import AuditLedger
-from .models import PortfolioSnapshot, RiskDecision, SignedAttestation, TradeProposal
+from .models import DecisionStatus, PortfolioSnapshot, RiskDecision, SignedAttestation, TradeProposal
 from .policy import RiskPolicy, evaluate_proposal
 
 
@@ -91,6 +97,37 @@ class FirewallService:
         self.kill_switch = kill_switch
         self.authority = authority
         self.ledger = ledger
+        self._custom_guards: dict[str, CustomGuardFn] = {}
+        self._declarative_rules: dict[str, DeclarativeGuardRule] = {}
+
+    def register_guard(self, name: str, fn: CustomGuardFn) -> None:
+        """Register a deterministic Python custom guard evaluated before Ed25519 signing."""
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("Guard name must be non-empty.")
+        self._custom_guards[cleaned] = fn
+
+    def guard(self, name: str):
+        """Decorator shorthand for register_guard(name, fn)."""
+        def _decorator(fn: CustomGuardFn) -> CustomGuardFn:
+            self.register_guard(name, fn)
+            return fn
+        return _decorator
+
+    def unregister_guard(self, name: str) -> bool:
+        return self._custom_guards.pop(name.strip(), None) is not None
+
+    def add_declarative_rule(self, rule: DeclarativeGuardRule) -> None:
+        self._declarative_rules[rule.rule_id] = rule
+
+    def remove_declarative_rule(self, rule_id: str) -> bool:
+        return self._declarative_rules.pop(rule_id, None) is not None
+
+    def list_custom_guards(self) -> dict[str, list[str]]:
+        return {
+            "python_guards": sorted(self._custom_guards.keys()),
+            "declarative_rules": sorted(self._declarative_rules.keys()),
+        }
 
     @classmethod
     def from_data_dir(
@@ -131,6 +168,47 @@ class FirewallService:
             policy=self.policy,
             kill_switch=self.kill_switch,
         )
+
+        # Evaluate extensible declarative rules and Python custom guards (fail closed on error)
+        custom_violations: list[GuardViolation] = []
+        for rule in self._declarative_rules.values():
+            try:
+                v = evaluate_declarative_rule(rule, proposal, portfolio)
+                if v is not None:
+                    custom_violations.append(v)
+            except Exception as exc:
+                custom_violations.append(
+                    GuardViolation(
+                        code="CUSTOM_GUARD_ERROR",
+                        reason=f"Declarative rule '{rule.rule_id}' raised {type(exc).__name__}: {exc}",
+                        guard_name=rule.name,
+                    )
+                )
+
+        for gname, gfn in self._custom_guards.items():
+            try:
+                res = gfn(proposal, portfolio)
+                if isinstance(res, GuardViolation):
+                    custom_violations.append(res)
+                elif isinstance(res, list):
+                    custom_violations.extend(v for v in res if isinstance(v, GuardViolation))
+            except Exception as exc:
+                custom_violations.append(
+                    GuardViolation(
+                        code="CUSTOM_GUARD_ERROR",
+                        reason=f"Custom guard '{gname}' raised {type(exc).__name__}: {exc}",
+                        guard_name=gname,
+                    )
+                )
+
+        if custom_violations:
+            decision.approved = False
+            decision.status = DecisionStatus.VETOED
+            for v in custom_violations:
+                if v.code not in decision.reason_codes:
+                    decision.reason_codes.append(v.code)
+                decision.reasons.append(f"[{v.guard_name}] {v.reason}")
+
         if decision.approved:
             decision.attestation = self.authority.issue(proposal)
 

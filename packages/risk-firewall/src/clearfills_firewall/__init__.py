@@ -2,6 +2,12 @@
 
 from .adapters import from_ai_hedge_fund_signal, from_tradingagents_decision
 from .attestation import AttestationAuthority, canonical_order_hash
+from .custom_guards import (
+    CustomGuardFn,
+    DeclarativeGuardRule,
+    GuardViolation,
+    evaluate_declarative_rule,
+)
 from .killswitch import KillSwitch, KillSwitchState
 from .ledger import AuditLedger, GENESIS_HASH
 from .mcp_server import handle_jsonrpc_request, run_stdio_server
@@ -37,11 +43,14 @@ __all__ = [
     "BenchmarkReport",
     "BenchmarkScenarioResult",
     "CompiledPolicyResult",
+    "CustomGuardFn",
     "DecisionStatus",
+    "DeclarativeGuardRule",
     "ExecutionReceipt",
     "ExtractedRule",
     "FirewallService",
     "GENESIS_HASH",
+    "GuardViolation",
     "KillSwitch",
     "KillSwitchState",
     "OrderType",
@@ -59,6 +68,7 @@ __all__ = [
     "compile_natural_language_policy",
     "create_app",
     "default_allocation_sleeves",
+    "evaluate_declarative_rule",
     "evaluate_proposal",
     "from_ai_hedge_fund_signal",
     "from_tradingagents_decision",
