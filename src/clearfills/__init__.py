@@ -27,7 +27,7 @@ from clearfills_firewall import (
     from_tradingagents_decision,
 )
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
