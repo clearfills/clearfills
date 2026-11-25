@@ -345,6 +345,8 @@ class ApprovalWorker:
             }
 
         receipt_dict = receipt.model_dump(mode="json")
+        receipt_dict["attestation_id"] = attestation.attestation_id
+        receipt_dict["order_ids"] = list(receipt.order_ids)
         broker_order_id = str(receipt.order_ids[0]) if receipt.order_ids else None
         fill_price = fresh_price
         report_payload = {
@@ -352,8 +354,6 @@ class ApprovalWorker:
             "fill_price": fill_price,
             "status": "submitted",
             "receipt": receipt_dict,
-            "attestation_id": attestation.attestation_id,
-            "order_ids": list(receipt.order_ids),
         }
         self._report_execution(approval_id, report_payload)
 
