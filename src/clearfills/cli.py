@@ -1,15 +1,22 @@
-"""Unified CLI for ClearFills (`clearfills init|doctor|mcp|watch|sync|validate|redteam|serve`)."""
+"""Unified CLI for ClearFills (`clearfills init|doctor|mcp|watch|sync|validate|redteam|serve|prove|verify-proof`)."""
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
+import re
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -702,6 +709,417 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+_TLSN_INSTALL_HINT = (
+    "Install the real TLSNotary CLI (Rust toolchain required):\n"
+    "  cargo install --git https://github.com/tlsnotary/tlsn tlsn-cli\n"
+    "Or place prebuilt `tlsn` / `tlsn-prover` / `tlsn-verifier` binaries in:\n"
+    "  ~/.clearfills/bin/\n"
+    "Or deploy your own TLSNotary notary server on Fly.io:\n"
+    "  cd src/deploy/tlsn-notary && fly deploy"
+)
+
+_FALLBACK_BROKER_DEFAULTS: dict[str, tuple[str, str]] = {
+    "alpaca": ("api.alpaca.markets", "/v2/orders/{order_id}"),
+    "alpaca_paper": ("paper-api.alpaca.markets", "/v2/orders/{order_id}"),
+    "kalshi": ("api.elections.kalshi.com", "/trade-api/v2/portfolio/orders/{order_id}"),
+    "ibkr_flex": ("gdcdyn.interactivebrokers.com", "/Universal/servlet/FlexStatementService.GetStatement"),
+}
+
+
+def _collect_broker_auth_from_env(broker: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Read broker credentials from standard environment variables without logging them."""
+    headers: dict[str, str] = {"Accept": "application/json"}
+    query_params: dict[str, str] = {}
+    if broker in ("alpaca", "alpaca_paper"):
+        key_id = os.environ.get("APCA_API_KEY_ID", "").strip()
+        secret = os.environ.get("APCA_API_SECRET_KEY", "").strip()
+        if key_id:
+            headers["APCA-API-KEY-ID"] = key_id
+        if secret:
+            headers["APCA-API-SECRET-KEY"] = secret
+    elif broker == "kalshi":
+        access_key = os.environ.get("KALSHI_ACCESS_KEY", os.environ.get("KALSHI_API_KEY", "")).strip()
+        signature = os.environ.get("KALSHI_ACCESS_SIGNATURE", "").strip()
+        if access_key:
+            headers["KALSHI-ACCESS-KEY"] = access_key
+        if signature:
+            headers["KALSHI-ACCESS-SIGNATURE"] = signature
+    elif broker in ("ibkr_flex", "ibkr"):
+        headers["Accept"] = "application/xml"
+        token = os.environ.get("IBKR_FLEX_TOKEN", "").strip()
+        if token:
+            query_params["t"] = token
+        query_params["v"] = "3"
+    return headers, query_params
+
+
+def _detect_tlsn_bin_fallback(role: str, explicit: Path | None = None) -> Path | None:
+    if explicit is not None:
+        exp = explicit.expanduser()
+        if exp.is_file() and os.access(exp, os.X_OK):
+            return exp
+    names = ("tlsn-prover", "tlsn") if role == "prover" else ("tlsn-verifier", "tlsn")
+    local_dir = Path.home() / ".clearfills" / "bin"
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+        cand = local_dir / name
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _cmd_prove(args: argparse.Namespace) -> int:
+    if args.install_hint:
+        print(_TLSN_INSTALL_HINT)
+        return 0
+
+    headers, query_params = _collect_broker_auth_from_env(args.broker)
+    if args.broker in ("ibkr_flex", "ibkr") and args.order_id:
+        query_params["q"] = args.order_id
+
+    output_path = args.output or Path(f"{args.order_id or args.broker}.presentation.tlsn")
+
+    try:
+        from clearfills_arena.tlsn_prover import (
+            BROKER_REDACTION_PROFILES,
+            TLSNotaryBinaryNotFoundError,
+            TLSNotaryConfig,
+            TLSNotaryRunner,
+            build_http_request_bytes,
+            build_redaction_plan,
+        )
+    except ImportError:
+        # Standalone open-core fallback (zero extra dependencies)
+        default_server, path_tpl = _FALLBACK_BROKER_DEFAULTS[args.broker]
+        server_name = (args.server_name or default_server).strip().lower()
+        path = args.request_path or path_tpl.format(order_id=args.order_id or "")
+        if args.plan_only:
+            payload = {
+                "broker": args.broker,
+                "server_name": server_name,
+                "path": path,
+                "notary_host": args.notary_host,
+                "notary_port": args.notary_port,
+                "notary_tls": not args.no_notary_tls,
+            }
+            print(json.dumps(payload, indent=2))
+            return 0
+        binary = _detect_tlsn_bin_fallback("prover", args.tlsn_bin)
+        if binary is None:
+            print(
+                "Error: TLSNotary prover binary (`tlsn-prover` / `tlsn`) not found on PATH "
+                "or in ~/.clearfills/bin/. ClearFills never fakes MPC-TLS proofs.\n"
+                f"{_TLSN_INSTALL_HINT}",
+                file=sys.stderr,
+            )
+            return 1
+        cmd = [str(binary)]
+        if binary.name == "tlsn":
+            cmd.append("prove")
+        cmd.extend(
+            [
+                "--notary-host",
+                args.notary_host,
+                "--notary-port",
+                str(args.notary_port),
+                "--server-name",
+                server_name,
+                "--output",
+                str(output_path),
+            ]
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            print(f"TLSNotary prover failed: {(proc.stderr or proc.stdout).strip()}", file=sys.stderr)
+            return 1
+        print(f"Wrote MPC-TLS presentation: {output_path}")
+        return 0
+
+    cfg = TLSNotaryConfig(
+        notary_host=args.notary_host,
+        notary_port=args.notary_port,
+        notary_tls=not args.no_notary_tls,
+        tlsn_bin=str(args.tlsn_bin) if args.tlsn_bin else None,
+        max_sent_data=args.max_sent_data,
+        max_recv_data=args.max_recv_data,
+    )
+    runner = TLSNotaryRunner(config=cfg)
+
+    if args.plan_only:
+        profile = BROKER_REDACTION_PROFILES[args.broker]
+        resolved_server = (args.server_name or profile.default_server_name).strip().lower()
+        path = args.request_path or profile.default_path_template.format(order_id=args.order_id or "")
+        req_bytes = build_http_request_bytes(
+            method="GET",
+            path=path,
+            host=resolved_server,
+            headers=headers,
+            query_params=query_params,
+        )
+        plan = build_redaction_plan(
+            broker=args.broker,
+            server_name=resolved_server,
+            request_bytes=req_bytes,
+        )
+        if args.json:
+            print(json.dumps(plan.to_tlsn_commit_spec(), indent=2))
+        else:
+            print(f"ClearFills TLSNotary Redaction Plan ({plan.broker} @ {plan.server_name})")
+            print(f"  Request bytes:   {plan.request_bytes_len}")
+            print(f"  Redacted ranges: {[(r.start, r.end, r.label) for r in plan.sent_redacted_ranges]}")
+            print(f"  Revealed ranges: {[(r.start, r.end) for r in plan.sent_revealed_ranges]}")
+        return 0
+
+    try:
+        result = runner.prove_broker_fill(
+            broker=args.broker,
+            order_id=args.order_id or "",
+            output_path=output_path,
+            headers=headers,
+            query_params=query_params,
+            server_name=args.server_name,
+            request_path=args.request_path,
+        )
+    except TLSNotaryBinaryNotFoundError as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "TLSN_BINARY_NOT_FOUND",
+                        "detail": str(exc),
+                        "install_hint": exc.install_hint,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result.model_dump(mode="json"), indent=2))
+    else:
+        print(f"Wrote MPC-TLS presentation: {result.presentation_path}")
+        print(f"  SHA-256: {result.presentation_sha256}")
+        print(f"  Server:  {result.server_name}")
+        print(f"  Notary:  {result.notary_host}:{result.notary_port}")
+    return 0
+
+
+def _verify_ed25519_envelope_standalone(
+    bundle_path: Path,
+    expected_server_name: str | None,
+    trusted_pubkeys_pem: list[str] | None,
+) -> dict[str, Any]:
+    """Zero-extra-dep stdlib + cryptography verifier for Ed25519 notary envelope JSON bundles."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        raw = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "valid": False,
+            "proof_type": "broker_reconciled_notary_envelope",
+            "trust_level": "ed25519_notary_envelope",
+            "path": str(bundle_path),
+            "errors": [f"INVALID_JSON_BUNDLE: {exc}"],
+        }
+
+    proof = raw.get("proof", raw) if isinstance(raw, dict) else {}
+    att = proof.get("notary_attestation") or {}
+    errors: list[str] = []
+
+    domain = str(att.get("server_domain") or "").strip().lower()
+    if expected_server_name and domain != expected_server_name.strip().lower():
+        errors.append(
+            f"SERVER_NAME_MISMATCH: expected={expected_server_name.strip().lower()!r} got={domain!r}"
+        )
+
+    commitment_payload = {
+        "venue": str(proof.get("venue") or "").strip().lower(),
+        "symbol": str(proof.get("symbol") or "").strip().upper(),
+        "side": str(proof.get("side") or "").strip().upper(),
+        "filled_qty": float(proof.get("filled_qty") or 0.0),
+        "avg_fill_price": float(proof.get("avg_fill_price") or 0.0),
+        "broker_order_id": str(proof.get("broker_order_id") or "").strip(),
+        "filled_at": str(proof.get("filled_at") or "").strip(),
+    }
+    expected_commit = hashlib.sha256(
+        json.dumps(commitment_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    got_commit = str(proof.get("transcript_commitment_sha256") or "").strip().lower()
+    if not hmac.compare_digest(got_commit, expected_commit):
+        errors.append("TRANSCRIPT_COMMITMENT_MISMATCH: revealed fill fields do not match commitment")
+
+    signing_payload = {
+        "protocol_version": att.get("protocol_version", "tlsnotary-v0.1-alpha"),
+        "server_domain": domain,
+        "cert_chain_sha256": str(att.get("cert_chain_sha256") or "").strip().lower(),
+        "notary_id": att.get("notary_id", ""),
+        "session_timestamp_utc": att.get("session_timestamp_utc", ""),
+        "account_id_redacted": bool(att.get("account_id_redacted", False)),
+        "transcript_commitment_sha256": proof.get("transcript_commitment_sha256", ""),
+    }
+    signing_bytes = json.dumps(
+        signing_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+    sig_verified: bool | None = None
+    sig_b64 = att.get("notary_signature_b64")
+    pems_to_try = list(trusted_pubkeys_pem) if trusted_pubkeys_pem is not None else (
+        [att["notary_pubkey_pem"]] if att.get("notary_pubkey_pem") else []
+    )
+    if trusted_pubkeys_pem is not None and not sig_b64:
+        sig_verified = False
+        errors.append("MISSING_NOTARY_SIGNATURE")
+    elif sig_b64 and pems_to_try:
+        try:
+            sig_bytes = base64.b64decode(sig_b64, validate=True)
+        except Exception:  # noqa: BLE001
+            sig_bytes = b""
+        verified_any = False
+        for pem in pems_to_try:
+            try:
+                key = serialization.load_pem_public_key(pem.encode("utf-8"))
+                if isinstance(key, Ed25519PublicKey):
+                    key.verify(sig_bytes, signing_bytes)
+                    verified_any = True
+                    break
+            except (InvalidSignature, ValueError):
+                continue
+        sig_verified = verified_any
+        if not verified_any:
+            errors.append("INVALID_NOTARY_SIGNATURE")
+
+    return {
+        "valid": len(errors) == 0 and sig_verified is not False,
+        "proof_type": "broker_reconciled_notary_envelope",
+        "trust_level": "ed25519_notary_envelope",
+        "path": str(bundle_path),
+        "server_name": domain,
+        "session_timestamp_utc": att.get("session_timestamp_utc", ""),
+        "signature_verified": sig_verified,
+        "fill": {
+            "venue": proof.get("venue"),
+            "symbol": proof.get("symbol"),
+            "side": proof.get("side"),
+            "filled_qty": proof.get("filled_qty"),
+            "avg_fill_price": proof.get("avg_fill_price"),
+            "broker_order_id": proof.get("broker_order_id"),
+            "filled_at": proof.get("filled_at"),
+        },
+        "errors": errors,
+    }
+
+
+def _cmd_verify_proof(args: argparse.Namespace) -> int:
+    trusted_pems: list[str] | None = None
+    if args.notary_pubkey is not None:
+        if not args.notary_pubkey.is_file():
+            print(f"Notary public key file not found: {args.notary_pubkey}", file=sys.stderr)
+            return 1
+        trusted_pems = [args.notary_pubkey.read_text(encoding="utf-8")]
+
+    try:
+        from clearfills_arena.tlsn_prover import TLSNotaryConfig, verify_clearfills_proof_bundle
+
+        cfg = TLSNotaryConfig(tlsn_bin=str(args.tlsn_bin) if args.tlsn_bin else None)
+        report = verify_clearfills_proof_bundle(
+            args.proof_path,
+            expected_server_name=args.server_name,
+            trusted_notary_pubkeys_pem=trusted_pems,
+            config=cfg,
+        )
+    except ImportError:
+        # Standalone open-core fallback
+        bundle = args.proof_path.expanduser().resolve()
+        if not bundle.is_file():
+            report = {
+                "valid": False,
+                "proof_type": "unknown",
+                "trust_level": "unknown",
+                "path": str(bundle),
+                "errors": [f"PROOF_FILE_NOT_FOUND: {bundle}"],
+            }
+        elif bundle.name.endswith(".presentation.tlsn") or bundle.suffix == ".tlsn":
+            binary = _detect_tlsn_bin_fallback("verifier", args.tlsn_bin)
+            if binary is None:
+                report = {
+                    "valid": False,
+                    "proof_type": "tlsnotary_mpc_tls",
+                    "trust_level": "mpc_tls_cryptographic",
+                    "path": str(bundle),
+                    "errors": [
+                        "TLSN_BINARY_NOT_FOUND: tlsn-verifier / tlsn not installed. ClearFills never fakes verification."
+                    ],
+                    "install_hint": _TLSN_INSTALL_HINT,
+                }
+            else:
+                cmd = [str(binary)]
+                if binary.name == "tlsn":
+                    cmd.append("verify")
+                cmd.extend(["--presentation", str(bundle), "--format", "json"])
+                if args.notary_pubkey:
+                    cmd.extend(["--notary-pubkey", str(args.notary_pubkey)])
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    report = {
+                        "valid": False,
+                        "proof_type": "tlsnotary_mpc_tls",
+                        "trust_level": "mpc_tls_cryptographic",
+                        "path": str(bundle),
+                        "errors": [f"TLSN_VERIFICATION_FAILED: {(proc.stderr or proc.stdout).strip()}"],
+                    }
+                else:
+                    parsed = json.loads(proc.stdout)
+                    got_server = str(parsed.get("server_name") or "").strip().lower()
+                    errs: list[str] = []
+                    if args.server_name and got_server != args.server_name.strip().lower():
+                        errs.append(
+                            f"SERVER_NAME_MISMATCH: expected={args.server_name.strip().lower()!r} got={got_server!r}"
+                        )
+                    report = {
+                        "valid": len(errs) == 0,
+                        "proof_type": "tlsnotary_mpc_tls",
+                        "trust_level": "mpc_tls_cryptographic",
+                        "path": str(bundle),
+                        "server_name": got_server,
+                        "session_timestamp_utc": str(parsed.get("session_timestamp_utc") or parsed.get("time") or ""),
+                        "errors": errs,
+                    }
+        else:
+            report = _verify_ed25519_envelope_standalone(bundle, args.server_name, trusted_pems)
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        status = "PASS" if report.get("valid") else "FAIL"
+        print(f"ClearFills Proof Verification ({report.get('proof_type', 'unknown')})")
+        print("-" * 64)
+        print(f"  {_fmt_status(status)} valid={report.get('valid')} trust_level={report.get('trust_level')}")
+        if report.get("server_name"):
+            print(f"  Server:    {report['server_name']}")
+        if report.get("session_timestamp_utc"):
+            print(f"  Timestamp: {report['session_timestamp_utc']}")
+        if report.get("errors"):
+            for err in report["errors"]:
+                print(f"  Error:     {err}")
+        print("-" * 64)
+
+    return 0 if report.get("valid") else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clearfills",
@@ -761,6 +1179,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_srv.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     p_srv.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080).")
 
+    # prove
+    p_prove = sub.add_parser(
+        "prove",
+        help="Generate a cryptographic TLSNotary MPC-TLS proof (.presentation.tlsn) for a broker fill.",
+    )
+    p_prove.add_argument(
+        "--broker",
+        choices=["alpaca", "alpaca_paper", "kalshi", "ibkr_flex"],
+        default="alpaca",
+        help="Broker redaction profile (default: alpaca).",
+    )
+    p_prove.add_argument("--order-id", default="", help="Broker order ID (or IBKR Flex query ID).")
+    p_prove.add_argument("--output", type=Path, default=None, help="Output .presentation.tlsn file path.")
+    p_prove.add_argument("--notary-host", default="notary.clearfills.com", help="TLSNotary notary server host.")
+    p_prove.add_argument("--notary-port", type=int, default=7047, help="TLSNotary notary server port (default: 7047).")
+    p_prove.add_argument("--no-notary-tls", action="store_true", help="Disable TLS when connecting to local dev notary.")
+    p_prove.add_argument("--server-name", default=None, help="Override broker TLS server hostname.")
+    p_prove.add_argument("--request-path", default=None, help="Override broker HTTP request path.")
+    p_prove.add_argument("--tlsn-bin", type=Path, default=None, help="Explicit path to tlsn / tlsn-prover binary.")
+    p_prove.add_argument("--max-sent-data", type=int, default=4096, help="Max MPC-TLS sent bytes (default: 4096).")
+    p_prove.add_argument("--max-recv-data", type=int, default=16384, help="Max MPC-TLS recv bytes (default: 16384).")
+    p_prove.add_argument("--plan-only", action="store_true", help="Output byte-range RedactionPlan without running MPC-TLS.")
+    p_prove.add_argument("--install-hint", action="store_true", help="Print TLSNotary CLI installation instructions and exit.")
+    p_prove.add_argument("--json", action="store_true", help="Output structured JSON.")
+
+    # verify-proof
+    p_vproof = sub.add_parser(
+        "verify-proof",
+        help="Verify a TLSNotary (.presentation.tlsn) or Ed25519 notary envelope (.json) fill proof.",
+    )
+    p_vproof.add_argument("proof_path", type=Path, help="Path to .presentation.tlsn or Ed25519 notary JSON bundle.")
+    p_vproof.add_argument("--server-name", default=None, help="Expected broker TLS server name (required for .presentation.tlsn).")
+    p_vproof.add_argument("--notary-pubkey", type=Path, default=None, help="Path to trusted notary public key PEM file.")
+    p_vproof.add_argument("--tlsn-bin", type=Path, default=None, help="Explicit path to tlsn / tlsn-verifier binary.")
+    p_vproof.add_argument("--json", action="store_true", help="Output structured JSON with explicit trust_level.")
+
     return parser
 
 
@@ -787,6 +1241,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_redteam(args)
     if args.command == "serve":
         return _cmd_serve(args)
+    if args.command == "prove":
+        return _cmd_prove(args)
+    if args.command == "verify-proof":
+        return _cmd_verify_proof(args)
     return 1
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
@@ -449,6 +450,263 @@ def verify_local_webauthn_cosign(
     return False, "WebAuthn cryptographic signature failed against all locally pinned trusted keys."
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def canonical_order_digest(approval: dict[str, Any]) -> str:
+    """Compute RFC 8785 JCS-style canonical SHA-256 hex digest over core order legs.
+
+    Binds `(symbol, side, quantity, limit_price, stop_price, venue)` so any mutation
+    to order parameters invalidates the WebAuthn challenge binding.
+    """
+    nested = _nested_order_fields(approval)
+    symbol = str(approval.get("symbol") or nested.get("symbol") or "").strip().upper()
+    side = str(approval.get("side") or nested.get("side") or "").strip().upper()
+    qty_val = _opt_float(
+        approval.get("quantity") if approval.get("quantity") is not None else nested.get("quantity")
+    )
+    lmt_val = _opt_float(
+        approval.get("limit_price")
+        if approval.get("limit_price") is not None
+        else nested.get("limit_price")
+    )
+    stp_val = _opt_float(
+        approval.get("stop_price")
+        if approval.get("stop_price") is not None
+        else nested.get("stop_price")
+    )
+    venue = str(approval.get("venue") or nested.get("venue") or _IBKR_VENUE).strip().lower()
+
+    canonical_obj: dict[str, Any] = {
+        "limit_price": round(lmt_val, 8) if lmt_val is not None else None,
+        "quantity": round(qty_val, 8) if qty_val is not None else None,
+        "side": side,
+        "stop_price": round(stp_val, 8) if stp_val is not None else None,
+        "symbol": symbol,
+        "venue": venue,
+    }
+    encoded = json.dumps(
+        canonical_obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _extract_webauthn_assertion(approval: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Return the first non-empty WebAuthn assertion dictionary present on `approval`."""
+    if not isinstance(approval, dict):
+        return None
+    for key in (
+        "webauthn_assertion",
+        "passkey_assertion",
+        "passkey_assertion_bundle",
+        "webauthn_proof",
+        "passkey_proof",
+    ):
+        candidate = approval.get(key)
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return None
+
+
+def _load_p256_spki_key(raw_key: str) -> tuple[ec.EllipticCurvePublicKey, bytes]:
+    """Load an ECDSA P-256 (SECP256R1) SPKI public key from base64/base64url DER or PEM."""
+    cleaned = raw_key.strip()
+    if not cleaned:
+        raise ValueError("Empty public key.")
+    if cleaned.startswith("-----BEGIN"):
+        pub = serialization.load_pem_public_key(cleaned.encode("utf-8"))
+    else:
+        pub = serialization.load_der_public_key(_decode_b64_flexible(cleaned))
+    if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
+        raise ValueError("Public key must be an ECDSA P-256 (SECP256R1) key.")
+    canonical_der = pub.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return pub, canonical_der
+
+
+def _extract_client_challenge(assertion: dict[str, Any]) -> Optional[str]:
+    """Extract the challenge string from `clientDataJSON` (or fallback `challenge` field)."""
+    raw_client_data = assertion.get("clientDataJSON") or assertion.get("client_data_json")
+    if isinstance(raw_client_data, str) and raw_client_data.strip():
+        try:
+            client_data = json.loads(_decode_b64_flexible(raw_client_data).decode("utf-8"))
+            if isinstance(client_data, dict):
+                ch = str(client_data.get("challenge") or "").strip()
+                if ch:
+                    return ch
+        except Exception:
+            pass
+    raw_ch = assertion.get("challenge")
+    if isinstance(raw_ch, str) and raw_ch.strip():
+        return raw_ch.strip()
+    return None
+
+
+def verify_webauthn_cosignature(
+    approval: dict[str, Any],
+    registered_pubkeys_b64: list[str] | None = None,
+    *,
+    require_uv: bool = False,
+) -> tuple[bool, str]:
+    """Verify a hardware WebAuthn ECDSA P-256 co-signature bound to canonical order legs.
+
+    Recomputes the RFC 8785 JCS-style SHA-256 digest of
+    `(symbol, side, quantity, limit_price, stop_price, venue)`, validates
+    `clientDataJSON` (`type == "webauthn.get"` and order-digest challenge binding),
+    checks `authenticatorData` flags (`UP` bit 0x01, plus `UV` bit 0x04 when
+    `require_uv=True`), verifies the P-256 DER ECDSA-SHA256 signature over
+    `authenticatorData || sha256(clientDataJSON)`, and enforces the locally pinned
+    `registered_pubkeys_b64` allowlist when configured.
+    """
+    if not isinstance(approval, dict):
+        return False, "Approval payload must be a dictionary."
+
+    assertion = _extract_webauthn_assertion(approval)
+    if assertion is None:
+        return False, "Missing WebAuthn passkey assertion on approval."
+
+    raw_auth_data = assertion.get("authenticatorData") or assertion.get("authenticator_data")
+    raw_client_data = assertion.get("clientDataJSON") or assertion.get("client_data_json")
+    raw_signature = assertion.get("signature")
+    raw_pubkey = (
+        assertion.get("public_key_spki_b64")
+        or assertion.get("publicKeySpkiB64")
+        or assertion.get("public_key")
+    )
+
+    if (
+        not isinstance(raw_auth_data, str)
+        or not raw_auth_data.strip()
+        or not isinstance(raw_client_data, str)
+        or not raw_client_data.strip()
+        or not isinstance(raw_signature, str)
+        or not raw_signature.strip()
+    ):
+        return (
+            False,
+            "Missing required WebAuthn assertion fields (authenticatorData, clientDataJSON, signature).",
+        )
+
+    try:
+        auth_data = _decode_b64_flexible(raw_auth_data)
+        client_data_bytes = _decode_b64_flexible(raw_client_data)
+        sig_bytes = _decode_b64_flexible(raw_signature)
+    except Exception as exc:
+        return False, f"Malformed base64 WebAuthn assertion payload: {exc}"
+
+    if len(auth_data) < 37:
+        return False, "Invalid WebAuthn authenticatorData (must be at least 37 bytes)."
+
+    flags = auth_data[32]
+    if (flags & 0x01) == 0:
+        return False, "WebAuthn User Present (UP) flag is not set."
+    if require_uv and (flags & 0x04) == 0:
+        return False, "WebAuthn User Verified (UV) flag is required but not set."
+
+    try:
+        client_data = json.loads(client_data_bytes.decode("utf-8"))
+    except Exception:
+        return False, "Invalid JSON in WebAuthn clientDataJSON."
+    if not isinstance(client_data, dict):
+        return False, "WebAuthn clientDataJSON must be a JSON object."
+    if client_data.get("type") != "webauthn.get":
+        return (
+            False,
+            f"Invalid WebAuthn clientDataJSON.type {client_data.get('type')!r} (expected 'webauthn.get').",
+        )
+
+    client_challenge = str(client_data.get("challenge") or "").strip()
+    if not client_challenge:
+        return False, "Missing challenge in WebAuthn clientDataJSON."
+
+    explicit_challenge = assertion.get("challenge")
+    if (
+        isinstance(explicit_challenge, str)
+        and explicit_challenge.strip()
+        and explicit_challenge.strip() != client_challenge
+    ):
+        return False, "WebAuthn assertion challenge does not match clientDataJSON.challenge."
+
+    # Recompute canonical order digest and verify challenge binding.
+    order_digest = canonical_order_digest(approval)
+    valid_challenges: set[str] = {
+        order_digest,
+        _b64u_encode(bytes.fromhex(order_digest)),
+        _b64u_encode(order_digest.encode("utf-8")),
+    }
+    raw_nonce = assertion.get("challenge_nonce") or approval.get("challenge_nonce")
+    challenge_nonce = raw_nonce.strip() if isinstance(raw_nonce, str) and raw_nonce.strip() else None
+    if challenge_nonce is not None:
+        valid_challenges.add(
+            _b64u_encode(hashlib.sha256(f"{challenge_nonce}:{order_digest}".encode("utf-8")).digest())
+        )
+        if _has_canonical_approval_record_fields(approval):
+            recomputed_approval_hash = compute_approval_hash(approval)
+            valid_challenges.add(
+                _b64u_encode(
+                    hashlib.sha256(
+                        f"{challenge_nonce}:{recomputed_approval_hash}".encode("utf-8")
+                    ).digest()
+                )
+            )
+
+    if client_challenge not in valid_challenges:
+        return (
+            False,
+            "WebAuthn challenge does not match canonical order digest binding (order parameters may have been tampered).",
+        )
+
+    # Parse locally pinned P-256 allowlist if configured.
+    pinned_keys_raw = [
+        k.strip() for k in (registered_pubkeys_b64 or []) if isinstance(k, str) and k.strip()
+    ]
+    pinned_by_der: dict[bytes, ec.EllipticCurvePublicKey] = {}
+    if pinned_keys_raw:
+        for raw_pinned in pinned_keys_raw:
+            try:
+                pub, der = _load_p256_spki_key(raw_pinned)
+                pinned_by_der[der] = pub
+            except Exception:
+                continue
+        if not pinned_by_der:
+            return False, "No valid ECDSA P-256 SPKI keys in registered_pubkeys_b64."
+
+    candidate_keys: list[ec.EllipticCurvePublicKey] = []
+    if isinstance(raw_pubkey, str) and raw_pubkey.strip():
+        try:
+            pub_key, pub_der = _load_p256_spki_key(raw_pubkey)
+        except Exception as exc:
+            return False, f"Invalid WebAuthn public_key_spki_b64: {exc}"
+        if pinned_by_der and pub_der not in pinned_by_der:
+            return False, "WebAuthn public key is not in the locally pinned allowlist."
+        candidate_keys = [pub_key]
+    elif pinned_by_der:
+        candidate_keys = list(pinned_by_der.values())
+    else:
+        return (
+            False,
+            "Missing public_key_spki_b64 in WebAuthn assertion and no registered_pubkeys_b64 configured.",
+        )
+
+    signed_payload = auth_data + hashlib.sha256(client_data_bytes).digest()
+    for pub_key in candidate_keys:
+        try:
+            pub_key.verify(sig_bytes, signed_payload, ec.ECDSA(hashes.SHA256()))
+            return True, "ok"
+        except InvalidSignature:
+            continue
+        except Exception:
+            continue
+
+    return False, "Invalid WebAuthn ECDSA P-256 signature."
+
+
 class ApprovalWorker:
     """Polls ClearFills Cloud for approved IBKR orders and executes them with fresh attestations."""
 
@@ -466,6 +724,8 @@ class ApprovalWorker:
         max_favorable_gap_bps: float = 1000.0,
         trusted_passkey_spki_b64: Optional[list[str]] = None,
         require_webauthn_cosign: bool = False,
+        require_passkey_cosign: Optional[bool] = None,
+        require_passkey_uv: bool = False,
     ) -> None:
         self.adapter = adapter
         self.api_key = api_key.strip()
@@ -475,7 +735,8 @@ class ApprovalWorker:
         self.dry_run = bool(dry_run)
         self._cloud_transport = cloud_transport
         self._timeout = float(timeout)
-        desk_id = getattr(getattr(getattr(adapter, "runtime", None), "config", None), "desk_id", "desk")
+        desk_cfg = getattr(getattr(adapter, "runtime", None), "config", None)
+        desk_id = getattr(desk_cfg, "desk_id", "desk")
         default_worker_id = f"{desk_id}-{socket.gethostname()}"
         self.worker_id = (worker_id or default_worker_id).strip() or default_worker_id
         self._heartbeat_interval_sec = float(heartbeat_interval_sec)
@@ -485,6 +746,15 @@ class ApprovalWorker:
             k.strip() for k in (trusted_passkey_spki_b64 or []) if isinstance(k, str) and k.strip()
         ]
         self.require_webauthn_cosign: bool = bool(require_webauthn_cosign)
+        if require_passkey_cosign is not None:
+            self.require_passkey_cosign = bool(require_passkey_cosign)
+        else:
+            self.require_passkey_cosign = _env_flag("CLEARFILLS_REQUIRE_PASSKEY_COSIGN") or bool(
+                getattr(desk_cfg, "require_passkey_cosign", False)
+            )
+        self.require_passkey_uv: bool = bool(require_passkey_uv) or _env_flag(
+            "CLEARFILLS_REQUIRE_PASSKEY_UV"
+        )
 
     def _cloud_request(
         self,
@@ -597,43 +867,30 @@ class ApprovalWorker:
                 "detail": detail,
             }
 
-        # 3a-ii. Independent local hardware passkey co-signature check (when operator_passkey_spki_b64 is pinned).
-        trusted_keys = getattr(self.adapter.runtime.config, "operator_passkey_spki_b64", [])
+        # 3a-ii. Dual-Key Hardware WebAuthn P-256 co-signature verification (fail closed before IBKR).
+        trusted_keys = list(getattr(self.adapter.runtime.config, "operator_passkey_spki_b64", []) or [])
+        combined_pinned_keys: list[str] = list(dict.fromkeys([*trusted_keys, *self._trusted_passkey_spki_b64]))
         used_cosign_challenge: Optional[str] = None
-        if trusted_keys:
-            cosign_ok, cosign_reason = verify_operator_passkey_cosignature(record, list(trusted_keys))
-            if cosign_ok:
-                raw_bundle = (
-                    record.get("passkey_assertion_bundle")
-                    or record.get("passkey_assertion")
-                    or record.get("webauthn_proof")
-                    or record.get("passkey_proof")
-                )
-                if isinstance(raw_bundle, dict):
-                    ch = str(raw_bundle.get("challenge") or "").strip()
-                    if ch in self._used_passkey_challenges:
-                        cosign_ok = False
-                        cosign_reason = "Replayed WebAuthn passkey challenge rejected by local worker."
-                    elif ch:
-                        used_cosign_challenge = ch
-            if not cosign_ok:
-                detail = f"Operator hardware passkey co-signature verification failed: {cosign_reason}"
-                self._report_execution(
-                    approval_id,
-                    {"status": "execution_failed", "detail": detail},
-                )
-                return {
-                    "approval_id": approval_id,
-                    "symbol": symbol,
-                    "status": "execution_failed",
-                    "detail": detail,
-                }
+        assertion = _extract_webauthn_assertion(record)
 
-        # 3a.5. Independent local hardware WebAuthn co-signature verification (fail closed before IBKR).
-        if self.require_webauthn_cosign or self._trusted_passkey_spki_b64:
-            cosign_ok, cosign_detail = verify_local_webauthn_cosign(
-                record, self._trusted_passkey_spki_b64
+        if self.require_passkey_cosign or (
+            assertion is not None
+            and not trusted_keys
+            and not self.require_webauthn_cosign
+            and not self._trusted_passkey_spki_b64
+        ):
+            cosign_ok, cosign_detail = verify_webauthn_cosignature(
+                record,
+                registered_pubkeys_b64=combined_pinned_keys or None,
+                require_uv=self.require_passkey_uv,
             )
+            if cosign_ok and assertion is not None:
+                ch = _extract_client_challenge(assertion)
+                if ch and ch in self._used_passkey_challenges:
+                    cosign_ok = False
+                    cosign_detail = "Replayed WebAuthn passkey challenge rejected by local worker."
+                elif ch:
+                    used_cosign_challenge = ch
             if not cosign_ok:
                 self._report_execution(
                     approval_id,
@@ -645,6 +902,44 @@ class ApprovalWorker:
                     "status": "cosign_rejected",
                     "detail": cosign_detail,
                 }
+        else:
+            if trusted_keys:
+                cosign_ok, cosign_reason = verify_operator_passkey_cosignature(record, trusted_keys)
+                if cosign_ok and assertion is not None:
+                    ch = str(assertion.get("challenge") or "").strip() or _extract_client_challenge(assertion)
+                    if ch and ch in self._used_passkey_challenges:
+                        cosign_ok = False
+                        cosign_reason = "Replayed WebAuthn passkey challenge rejected by local worker."
+                    elif ch:
+                        used_cosign_challenge = ch
+                if not cosign_ok:
+                    detail = f"Operator hardware passkey co-signature verification failed: {cosign_reason}"
+                    self._report_execution(
+                        approval_id,
+                        {"status": "execution_failed", "detail": detail},
+                    )
+                    return {
+                        "approval_id": approval_id,
+                        "symbol": symbol,
+                        "status": "execution_failed",
+                        "detail": detail,
+                    }
+
+            if self.require_webauthn_cosign or self._trusted_passkey_spki_b64:
+                cosign_ok, cosign_detail = verify_local_webauthn_cosign(
+                    record, self._trusted_passkey_spki_b64
+                )
+                if not cosign_ok:
+                    self._report_execution(
+                        approval_id,
+                        {"status": "cosign_rejected", "detail": cosign_detail},
+                    )
+                    return {
+                        "approval_id": approval_id,
+                        "symbol": symbol,
+                        "status": "cosign_rejected",
+                        "detail": cosign_detail,
+                    }
 
         # 3b. Fetch fresh live quote from IBKR.
         quote = self.adapter.get_quote(symbol)
