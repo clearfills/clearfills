@@ -16,8 +16,21 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Run unified clearfills tests
+        run: |
+          uv sync --extra dev
+          uv run pytest -v
       - name: Run clearfills-firewall tests
         working-directory: packages/risk-firewall
         run: |
           uv sync --extra dev
           uv run pytest -v
+      - name: Run clearfills-desk tests
+        working-directory: packages/clearfills-desk
+        run: |
+          uv sync --extra dev
+          uv run pytest -v
+      - name: Build & verify unified clearfills wheel
+        run: |
+          uv build
+          uvx twine check dist/*

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 from .attestation import AttestationAuthority, canonical_order_hash
 from .killswitch import KillSwitch, KillSwitchState
@@ -205,8 +206,16 @@ class FirewallService:
         return AuditVerifyResponse(valid=valid, error=err, entry_count=count)
 
 
-def create_app(service: Optional[FirewallService] = None) -> FastAPI:
+def create_app(service: Optional[FirewallService] = None) -> "FastAPI":
     """Create the FastAPI application wired to a `FirewallService` instance."""
+    try:
+        from fastapi import FastAPI, HTTPException
+        from fastapi.responses import JSONResponse
+    except ImportError as exc:
+        raise ImportError(
+            "FastAPI is required for the HTTP server. Install with: pip install 'clearfills[server]'"
+        ) from exc
+
     if service is None:
         data_dir = os.environ.get("CLEARFILLS_DATA_DIR", "./.clearfills_data")
         policy_path = os.environ.get("CLEARFILLS_POLICY_YAML")
@@ -273,7 +282,12 @@ def create_app(service: Optional[FirewallService] = None) -> FastAPI:
 
 def main() -> None:
     """Run the FastAPI risk firewall server via uvicorn."""
-    import uvicorn
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise ImportError(
+            "uvicorn is required for the HTTP server. Install with: pip install 'clearfills[server]'"
+        ) from exc
 
     host = os.environ.get("CLEARFILLS_HOST", "127.0.0.1")
     port = int(os.environ.get("CLEARFILLS_PORT", "8080"))

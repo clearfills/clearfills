@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
+import urllib.request
 from typing import Any, Literal
-
-import httpx
 
 _SENSITIVE_PATTERNS = [
     re.compile(r"\b(?:DU|U)\d{5,12}\b"),  # IBKR paper/live account IDs
@@ -58,11 +58,23 @@ def publish_arena_heartbeat(
         "latest_rationale": sanitize_text(latest_rationale),
         "traces": [],
     }
-    resp = httpx.post(
-        f"{api_base.rstrip('/')}/api/v1/arena/ingest",
-        json=payload,
-        headers={"Authorization": f"Bearer {ingest_token}"},
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    url = f"{api_base.rstrip('/')}/api/v1/arena/ingest"
+    headers = {
+        "Authorization": f"Bearer {ingest_token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        import httpx
+
+        resp = httpx.post(url, json=payload, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+    except ImportError:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))

@@ -1,4 +1,4 @@
-name: Publish clearfills-firewall to PyPI
+name: Publish clearfills to PyPI
 
 on:
   release:
@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  publish:
+  publish-clearfills:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/clearfills-firewall
+      url: https://pypi.org/p/clearfills
     permissions:
       id-token: write
     steps:
@@ -18,12 +18,11 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           python-version: "3.12"
-      - name: Build distribution
-        working-directory: packages/risk-firewall
+      - name: Build clearfills distribution
         run: |
           uv build
           uvx twine check dist/*
-      - name: Publish to PyPI via Trusted Publishing (OIDC)
+      - name: Publish clearfills to PyPI via Trusted Publishing (OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: packages/risk-firewall/dist/
+          packages-dir: dist/
