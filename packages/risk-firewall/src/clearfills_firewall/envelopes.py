@@ -7,6 +7,7 @@ with runaway-loop throttling and live equity-curve decay / drawdown auto-kill.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
@@ -15,6 +16,11 @@ from enum import Enum
 from typing import Any, Optional, Sequence
 from uuid import uuid4
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import OrderType, TradeProposal, utc_now
@@ -196,6 +202,40 @@ def compute_envelope_signature_hash(envelope: "StrategyEnvelope") -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def sign_envelope_ed25519(
+    envelope: "StrategyEnvelope",
+    private_key: Ed25519PrivateKey,
+) -> tuple[str, str]:
+    """Compute canonical SHA-256 digest and sign it with an Ed25519 private key.
+
+    Returns ``(envelope_digest, "ed25519:<base64_signature>")``.
+    """
+    digest = compute_envelope_signature_hash(envelope)
+    raw_sig = private_key.sign(digest.encode("utf-8"))
+    sig_b64 = base64.b64encode(raw_sig).decode("ascii")
+    return digest, f"ed25519:{sig_b64}"
+
+
+def verify_envelope_ed25519(
+    envelope: "StrategyEnvelope",
+    signature: str,
+    public_key: Ed25519PublicKey,
+) -> bool:
+    """Verify an ``ed25519:<base64_signature>`` over a StrategyEnvelope's canonical SHA-256 digest."""
+    if not isinstance(signature, str) or not signature.startswith("ed25519:"):
+        return False
+    sig_b64 = signature[len("ed25519:") :]
+    if not sig_b64:
+        return False
+    try:
+        raw_sig = base64.b64decode(sig_b64.encode("ascii"), validate=True)
+        digest = compute_envelope_signature_hash(envelope)
+        public_key.verify(raw_sig, digest.encode("utf-8"))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
 class StrategyEnvelope(BaseModel):
     """Human-signed risk envelope allowing autonomous CPU strategies to execute within hard caps."""
 
@@ -232,7 +272,19 @@ class StrategyEnvelope(BaseModel):
         description="Optional peak-to-trough max drawdown threshold in percent (e.g. 10.0 for 10%).",
     )
     signed_by: str = Field(..., min_length=1, max_length=256)
+    envelope_digest: str = Field(
+        default="",
+        description="Canonical SHA-256 hex digest over the envelope's signed terms.",
+    )
     signature_hash: str = Field(default="")
+    signature_algorithm: str = Field(
+        default="sha256",
+        description="Cryptographic algorithm used to produce signature_hash (e.g. 'ed25519', 'hmac-sha256', 'sha256').",
+    )
+    signing_key_id: Optional[str] = Field(
+        default=None,
+        description="Identifier of the server Ed25519 signing key when signature_algorithm='ed25519'.",
+    )
     expires_at: Optional[str] = Field(
         default=None,
         description="Optional ISO-8601 UTC expiry timestamp.",
@@ -245,8 +297,11 @@ class StrategyEnvelope(BaseModel):
         return [s.strip().upper() for s in v if isinstance(s, str) and s.strip()]
 
     def model_post_init(self, __context: Any) -> None:
+        digest = compute_envelope_signature_hash(self)
+        if not self.envelope_digest:
+            object.__setattr__(self, "envelope_digest", digest)
         if not self.signature_hash:
-            object.__setattr__(self, "signature_hash", compute_envelope_signature_hash(self))
+            object.__setattr__(self, "signature_hash", digest)
 
 
 class EnvelopeVerdict(BaseModel):
@@ -303,6 +358,8 @@ class EnvelopeEvaluator:
         daily_pnl_usd: float = 0.0,
         now: Optional[datetime] = None,
         reference_price: Optional[float] = None,
+        is_reducing: bool = False,
+        current_position_qty: float = 0.0,
     ) -> EnvelopeVerdict:
         """Deterministically evaluate a TradeProposal against a signed StrategyEnvelope.
 
@@ -384,28 +441,48 @@ class EnvelopeEvaluator:
             )
 
         # 5. Per-order and aggregate strategy notional caps
+        # Risk-reducing closes/flattens must NEVER be blocked by notional caps.
+        side_str = (
+            proposal.side.value.upper()
+            if hasattr(proposal.side, "value")
+            else str(proposal.side).strip().upper()
+        )
+        qty = abs(float(proposal.quantity))
+        reducing = (
+            bool(is_reducing)
+            or (current_position_qty > 0 and side_str == "SELL" and qty <= current_position_qty)
+            or (current_position_qty < 0 and side_str == "BUY" and qty <= abs(current_position_qty))
+        )
+        metrics["is_reducing"] = reducing
+
         effective_price = proposal.limit_price if proposal.limit_price is not None else reference_price
         if effective_price is None or effective_price <= 0:
-            add_violation(
-                "ENVELOPE_NOTIONAL_EXCEEDED",
-                "Missing positive limit_price or reference_price to verify order notional against envelope cap.",
-            )
+            if not reducing:
+                add_violation(
+                    "ENVELOPE_NOTIONAL_EXCEEDED",
+                    "Missing positive limit_price or reference_price to verify order notional against envelope cap.",
+                )
         else:
             order_notional = abs(float(proposal.quantity) * float(effective_price))
-            projected_strategy_notional = max(0.0, float(current_strategy_notional_usd)) + order_notional
+            current_notional = max(0.0, float(current_strategy_notional_usd))
+            if reducing:
+                projected_strategy_notional = max(0.0, current_notional - order_notional)
+            else:
+                projected_strategy_notional = current_notional + order_notional
             metrics["order_notional_usd"] = round(order_notional, 4)
             metrics["projected_strategy_notional_usd"] = round(projected_strategy_notional, 4)
 
-            if order_notional > envelope.max_order_notional_usd:
-                add_violation(
-                    "ENVELOPE_NOTIONAL_EXCEEDED",
-                    f"Order notional ${order_notional:,.2f} exceeds max_order_notional_usd ${envelope.max_order_notional_usd:,.2f}.",
-                )
-            if projected_strategy_notional > envelope.max_strategy_notional_usd:
-                add_violation(
-                    "ENVELOPE_NOTIONAL_EXCEEDED",
-                    f"Projected strategy notional ${projected_strategy_notional:,.2f} exceeds max_strategy_notional_usd ${envelope.max_strategy_notional_usd:,.2f}.",
-                )
+            if not reducing:
+                if order_notional > envelope.max_order_notional_usd:
+                    add_violation(
+                        "ENVELOPE_NOTIONAL_EXCEEDED",
+                        f"Order notional ${order_notional:,.2f} exceeds max_order_notional_usd ${envelope.max_order_notional_usd:,.2f}.",
+                    )
+                if projected_strategy_notional > envelope.max_strategy_notional_usd:
+                    add_violation(
+                        "ENVELOPE_NOTIONAL_EXCEEDED",
+                        f"Projected strategy notional ${projected_strategy_notional:,.2f} exceeds max_strategy_notional_usd ${envelope.max_strategy_notional_usd:,.2f}.",
+                    )
 
         # 6. Runaway-loop throttle (orders per rolling 60s window)
         window_start = eval_now - timedelta(seconds=60)

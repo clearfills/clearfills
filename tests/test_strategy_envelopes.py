@@ -21,6 +21,8 @@ from clearfills_firewall import (
     list_risk_profiles,
     policy_from_profile,
 )
+from clearfills_firewall.envelopes import sign_envelope_ed25519, verify_envelope_ed25519
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 def _make_proposal(
@@ -310,3 +312,86 @@ def test_envelope_evaluator_sub_millisecond_latency() -> None:
         assert v.allowed is True
     avg_ms = ((time.perf_counter() - start) * 1000.0) / 100.0
     assert avg_ms < 1.0, f"Expected <1ms per evaluation, got {avg_ms:.3f}ms"
+
+
+def test_envelope_risk_reducing_position_close_allowed_at_95_pct_cap() -> None:
+    evaluator = EnvelopeEvaluator()
+    env = _make_envelope(
+        max_order_notional_usd=25_000.0,
+        max_strategy_notional_usd=100_000.0,
+    )
+
+    # Strategy is at 95% of its notional cap ($95,000 / $100,000; long 190 SPY @ $500)
+    # 1. Adding risk (BUY 20 = $10k -> $105k) is blocked
+    v_add = evaluator.evaluate(
+        _make_proposal(side=Side.BUY, quantity=20, limit_price=500.0),
+        env,
+        current_strategy_notional_usd=95_000.0,
+        current_position_qty=190.0,
+    )
+    assert v_add.allowed is False
+    assert "ENVELOPE_NOTIONAL_EXCEEDED" in v_add.violation_codes
+    assert v_add.metrics["is_reducing"] is False
+
+    # 2. Flattening the full long position (SELL 190 = $95k) MUST be allowed (auto-detected via current_position_qty)
+    v_flatten = evaluator.evaluate(
+        _make_proposal(side=Side.SELL, quantity=190, limit_price=500.0),
+        env,
+        current_strategy_notional_usd=95_000.0,
+        current_position_qty=190.0,
+    )
+    assert v_flatten.allowed is True
+    assert v_flatten.violation_codes == []
+    assert v_flatten.metrics["is_reducing"] is True
+    assert v_flatten.metrics["projected_strategy_notional_usd"] == 0.0
+
+    # 3. Covering a short position (current_position_qty=-190, BUY 190) MUST be allowed
+    v_cover = evaluator.evaluate(
+        _make_proposal(side=Side.BUY, quantity=190, limit_price=500.0),
+        env,
+        current_strategy_notional_usd=95_000.0,
+        current_position_qty=-190.0,
+    )
+    assert v_cover.allowed is True
+    assert v_cover.metrics["is_reducing"] is True
+    assert v_cover.metrics["projected_strategy_notional_usd"] == 0.0
+
+    # 4. Explicit is_reducing=True partial close is allowed and subtracts notional
+    v_explicit = evaluator.evaluate(
+        _make_proposal(side=Side.SELL, quantity=60, limit_price=500.0),
+        env,
+        current_strategy_notional_usd=95_000.0,
+        is_reducing=True,
+    )
+    assert v_explicit.allowed is True
+    assert v_explicit.metrics["is_reducing"] is True
+    assert v_explicit.metrics["projected_strategy_notional_usd"] == 65_000.0
+
+    # 5. Overselling past flat (long 100, SELL 150) is NOT risk-reducing and is blocked
+    v_flip = evaluator.evaluate(
+        _make_proposal(side=Side.SELL, quantity=150, limit_price=500.0),
+        env,
+        current_strategy_notional_usd=50_000.0,
+        current_position_qty=100.0,
+    )
+    assert v_flip.allowed is False
+    assert v_flip.metrics["is_reducing"] is False
+    assert "ENVELOPE_NOTIONAL_EXCEEDED" in v_flip.violation_codes
+
+
+def test_envelope_ed25519_sign_and_verify() -> None:
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    env = _make_envelope()
+
+    digest, sig = sign_envelope_ed25519(env, priv)
+    assert digest == compute_envelope_signature_hash(env)
+    assert len(digest) == 64
+    assert sig.startswith("ed25519:")
+    assert verify_envelope_ed25519(env, sig, pub) is True
+
+    # Tampering with signed terms invalidates the Ed25519 signature
+    tampered = env.model_copy(update={"max_order_notional_usd": 999_999.0})
+    assert verify_envelope_ed25519(tampered, sig, pub) is False
+    assert verify_envelope_ed25519(env, "ed25519:not_valid_base64!!!", pub) is False
+    assert verify_envelope_ed25519(env, "sha256:" + digest, pub) is False
