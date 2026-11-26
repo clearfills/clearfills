@@ -96,11 +96,18 @@ def test_three_named_risk_profiles_presets() -> None:
     catalog = list_risk_profiles()
     ids = [p["id"] for p in catalog]
     assert ids == ["long_term_holdco", "active_swing", "systematic_quant"]
-    assert catalog[0]["envelope_defaults"]["max_position_pct"] == 0.25
-    assert catalog[1]["envelope_defaults"]["max_risk_per_trade_pct"] == 0.015
-    assert catalog[1]["envelope_defaults"]["max_daily_loss_pct"] == 0.03
+    assert catalog[0]["envelope_defaults"]["max_position_pct"] == 25.0
+    assert catalog[0]["envelope_defaults"]["max_gross_exposure_pct"] == 100.0
+    assert catalog[1]["envelope_defaults"]["max_risk_per_trade_pct"] == 1.5
+    assert catalog[1]["envelope_defaults"]["max_daily_loss_pct"] == 3.0
+    assert catalog[1]["envelope_defaults"]["max_gross_exposure_pct"] == 100.0
     assert catalog[2]["envelope_defaults"]["max_orders_per_minute"] == 10
-    assert catalog[2]["envelope_defaults"]["max_gross_exposure_pct"] == 1.5
+    assert catalog[2]["envelope_defaults"]["max_gross_exposure_pct"] == 150.0
+    # Verify unit consistency between envelope_defaults and RiskPolicy
+    assert catalog[0]["envelope_defaults"]["max_gross_exposure_pct"] == catalog[0]["policy"]["max_gross_exposure_pct"]
+    assert catalog[1]["envelope_defaults"]["max_risk_per_trade_pct"] == catalog[1]["policy"]["max_risk_per_trade_pct"]
+    assert catalog[1]["envelope_defaults"]["max_daily_loss_pct"] == catalog[1]["policy"]["max_daily_loss_pct"]
+    assert catalog[2]["envelope_defaults"]["max_gross_exposure_pct"] == catalog[2]["policy"]["max_gross_exposure_pct"]
 
 
 def test_profiles_integrate_with_evaluate_proposal(tmp_path) -> None:
@@ -395,3 +402,96 @@ def test_envelope_ed25519_sign_and_verify() -> None:
     assert verify_envelope_ed25519(tampered, sig, pub) is False
     assert verify_envelope_ed25519(env, "ed25519:not_valid_base64!!!", pub) is False
     assert verify_envelope_ed25519(env, "sha256:" + digest, pub) is False
+
+
+def test_envelope_evaluator_authority_public_key_pem_fail_closed() -> None:
+    from cryptography.hazmat.primitives import serialization
+
+    priv = Ed25519PrivateKey.generate()
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    wrong_pub_pem = Ed25519PrivateKey.generate().public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    evaluator = EnvelopeEvaluator()
+    proposal = _make_proposal(symbol="SPY", quantity=10, limit_price=500.0)
+
+    # 1. Unsigned envelope (default sha256 digest only) fails closed when authority_public_key_pem is supplied
+    unsigned_env = _make_envelope()
+    v_unsigned = evaluator.evaluate(proposal, unsigned_env, authority_public_key_pem=pub_pem)
+    assert v_unsigned.allowed is False
+    assert "ENVELOPE_INVALID_SIGNATURE" in v_unsigned.violation_codes
+
+    # 2. Validly signed Ed25519 envelope passes
+    digest, sig = sign_envelope_ed25519(unsigned_env, priv)
+    signed_env = unsigned_env.model_copy(
+        update={
+            "envelope_digest": digest,
+            "signature_hash": sig,
+            "signature_algorithm": "ed25519",
+        }
+    )
+    v_valid = evaluator.evaluate(proposal, signed_env, authority_public_key_pem=pub_pem)
+    assert v_valid.allowed is True
+    assert v_valid.violation_codes == []
+
+    # 3. Tampered signed envelope fails closed
+    tampered_env = signed_env.model_copy(update={"max_order_notional_usd": 500_000.0})
+    v_tampered = evaluator.evaluate(proposal, tampered_env, authority_public_key_pem=pub_pem)
+    assert v_tampered.allowed is False
+    assert "ENVELOPE_INVALID_SIGNATURE" in v_tampered.violation_codes
+
+    # 4. Wrong authority public key fails closed
+    v_wrong_key = evaluator.evaluate(proposal, signed_env, authority_public_key_pem=wrong_pub_pem)
+    assert v_wrong_key.allowed is False
+    assert "ENVELOPE_INVALID_SIGNATURE" in v_wrong_key.violation_codes
+
+
+def test_envelope_contract_multiplier_and_flat_account_is_reducing_guard() -> None:
+    evaluator = EnvelopeEvaluator()
+    env = _make_envelope(
+        allowed_symbols=["CL", "SPY"],
+        max_order_notional_usd=25_000.0,
+        max_strategy_notional_usd=100_000.0,
+    )
+
+    # 1. Futures contract multiplier: 1 CL @ $75 with 1000x multiplier = $75,000 > $25,000 cap
+    cl_proposal = _make_proposal(symbol="CL", quantity=1, limit_price=75.0)
+    v_cl_blocked = evaluator.evaluate(cl_proposal, env, contract_multiplier=1000.0)
+    assert v_cl_blocked.allowed is False
+    assert "ENVELOPE_NOTIONAL_EXCEEDED" in v_cl_blocked.violation_codes
+    assert v_cl_blocked.metrics["order_notional_usd"] == pytest.approx(75_000.0)
+    assert v_cl_blocked.metrics["contract_multiplier"] == 1000.0
+
+    # Without multiplier (1.0), 1 @ $75 = $75 would pass
+    v_cl_default = evaluator.evaluate(cl_proposal, env)
+    assert v_cl_default.allowed is True
+    assert v_cl_default.metrics["order_notional_usd"] == pytest.approx(75.0)
+
+    # 2. Flat account cannot bypass notional cap by passing is_reducing=True
+    oversized = _make_proposal(symbol="SPY", side=Side.SELL, quantity=100, limit_price=500.0)
+    v_flat_bypass = evaluator.evaluate(
+        oversized,
+        env,
+        current_position_qty=0.0,
+        current_strategy_notional_usd=0.0,
+        is_reducing=True,
+    )
+    assert v_flat_bypass.allowed is False
+    assert v_flat_bypass.metrics["is_reducing"] is False
+    assert "ENVELOPE_NOTIONAL_EXCEEDED" in v_flat_bypass.violation_codes
+
+    # 3. With actual open position (or open strategy notional), is_reducing=True is honored
+    v_open_close = evaluator.evaluate(
+        oversized,
+        env,
+        current_position_qty=100.0,
+        current_strategy_notional_usd=50_000.0,
+        is_reducing=True,
+    )
+    assert v_open_close.allowed is True
+    assert v_open_close.metrics["is_reducing"] is True

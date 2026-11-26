@@ -781,3 +781,110 @@ def test_worker_persists_passkey_sign_counts_atomically_0600_and_blocks_rollback
     assert len(ib.placed) == 2
     assert json.loads(sc_path.read_text(encoding="utf-8")) == {"cred_yk_prod": 6}
     assert (sc_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_webauthn_jcs_canonical_binding_and_multi_key_sign_counts() -> None:
+    from clearfills_desk.webauthn_verifier import (
+        compute_approval_hash,
+        compute_spki_fingerprint,
+    )
+    from clearfills_firewall.canonical import canonical_json_bytes
+
+    # 1. RFC 8785 JCS: float 100.0 serializes identically to integer 100 in canonical_order_digest & compute_approval_hash
+    rec_float = {
+        "approval_id": "apr_jcs_01",
+        "symbol": "SGOV",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 100.0,
+        "limit_price": 100.0,
+        "venue": "ibkr",
+        "account_id": "U1234567",
+        "currency": "USD",
+        "tif": "DAY",
+        "agent_id": "allocator",
+    }
+    expected_obj = {
+        "account_id": "U1234567",
+        "currency": "USD",
+        "limit_price": 100,
+        "order_type": "LIMIT",
+        "quantity": 100,
+        "side": "BUY",
+        "stop_price": None,
+        "symbol": "SGOV",
+        "tif": "DAY",
+        "venue": "ibkr",
+    }
+    expected_digest = hashlib.sha256(canonical_json_bytes(expected_obj)).hexdigest()
+    assert canonical_order_digest(rec_float) == expected_digest
+    assert len(compute_approval_hash(rec_float)) == 64
+
+    # 2. Tampering order_type, account_id, currency, or tif changes canonical_order_digest
+    # and invalidates a signed WebAuthn assertion!
+    priv_touch, spki_touch = _gen_p256()
+    priv_yk, spki_yk = _gen_p256()
+    fp_touch = compute_spki_fingerprint(spki_touch)
+    fp_yk = compute_spki_fingerprint(spki_yk)
+
+    signed_rec = dict(rec_float)
+    signed_rec["webauthn_proof"] = _build_assertion(
+        signed_rec, priv_touch, nonce="nonce_jcs_01", credential_id="cred_touchid", sign_count=21
+    )
+    assert verify_webauthn_assertion(signed_rec, [spki_touch], current_sign_count=20).verified is True
+
+    for field, tampered_val in [
+        ("order_type", "MARKET"),
+        ("account_id", "U9999999"),
+        ("currency", "CAD"),
+        ("tif", "GTC"),
+    ]:
+        tampered = dict(signed_rec)
+        tampered[field] = tampered_val
+        assert canonical_order_digest(tampered) != expected_digest
+        res = verify_webauthn_assertion(tampered, [spki_touch], current_sign_count=20)
+        assert res.verified is False
+        assert "challenge" in res.detail.lower()
+
+    # 3. Multi-key independent sign_counts (Touch ID at 20, YubiKey at 5)
+    # Keyed by credential_id: YubiKey signs with sign_count=6 (<= Touch ID's 20, > YubiKey's 5) -> PASS!
+    rec_yk_6 = dict(rec_float)
+    rec_yk_6["webauthn_proof"] = _build_assertion(
+        rec_yk_6, priv_yk, nonce="nonce_multi_01", credential_id="cred_yubikey", sign_count=6
+    )
+    res_yk_cred = verify_webauthn_assertion(
+        rec_yk_6,
+        [spki_touch, spki_yk],
+        current_sign_counts={"cred_touchid": 20, "cred_yubikey": 5},
+    )
+    assert res_yk_cred.verified is True
+    assert res_yk_cred.new_sign_count == 6
+    assert res_yk_cred.key_fingerprint == fp_yk
+
+    # Keyed by SPKI fingerprint (even with empty credential_id):
+    # Touch ID is first in pinned list at count=20, YubiKey is second at count=5 -> YubiKey count=6 PASSES!
+    rec_yk_fp = dict(rec_float)
+    rec_yk_fp["webauthn_proof"] = _build_assertion(
+        rec_yk_fp, priv_yk, nonce="nonce_multi_02", credential_id="", sign_count=6
+    )
+    res_yk_fp = verify_webauthn_assertion(
+        rec_yk_fp,
+        [spki_touch, spki_yk],
+        current_sign_counts={fp_touch: 20, fp_yk: 5},
+    )
+    assert res_yk_fp.verified is True
+    assert res_yk_fp.new_sign_count == 6
+    assert res_yk_fp.key_fingerprint == fp_yk
+
+    # Rollback on YubiKey (sign_count=5 <= 5) is REJECTED even when Touch ID is also pinned!
+    rec_yk_rollback = dict(rec_float)
+    rec_yk_rollback["webauthn_proof"] = _build_assertion(
+        rec_yk_rollback, priv_yk, nonce="nonce_multi_03", credential_id="", sign_count=5
+    )
+    res_yk_rb = verify_webauthn_assertion(
+        rec_yk_rollback,
+        [spki_touch, spki_yk],
+        current_sign_counts={fp_touch: 20, fp_yk: 5},
+    )
+    assert res_yk_rb.verified is False
+    assert "sign_count" in res_yk_rb.detail.lower() or "cloned" in res_yk_rb.detail.lower()

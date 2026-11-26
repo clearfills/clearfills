@@ -17,6 +17,7 @@ from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -124,9 +125,9 @@ def list_risk_profiles() -> list[dict[str, Any]]:
             "envelope_defaults": {
                 "allow_market_orders": False,
                 "require_stop_loss": False,
-                "max_position_pct": 0.25,
+                "max_position_pct": 25.0,
                 "max_orders_per_minute": 2,
-                "max_gross_exposure_pct": 1.0,
+                "max_gross_exposure_pct": 100.0,
             },
             "policy": policy_from_profile(RiskProfilePreset.LONG_TERM_HOLDCO).model_dump(mode="json"),
         },
@@ -145,10 +146,10 @@ def list_risk_profiles() -> list[dict[str, Any]]:
             "envelope_defaults": {
                 "allow_market_orders": False,
                 "require_stop_loss": True,
-                "max_risk_per_trade_pct": 0.015,
-                "max_daily_loss_pct": 0.03,
+                "max_risk_per_trade_pct": 1.5,
+                "max_daily_loss_pct": 3.0,
                 "max_orders_per_minute": 5,
-                "max_gross_exposure_pct": 1.0,
+                "max_gross_exposure_pct": 100.0,
             },
             "policy": policy_from_profile(RiskProfilePreset.ACTIVE_SWING).model_dump(mode="json"),
         },
@@ -168,7 +169,7 @@ def list_risk_profiles() -> list[dict[str, Any]]:
             "envelope_defaults": {
                 "allow_market_orders": True,
                 "require_stop_loss": False,
-                "max_gross_exposure_pct": 1.5,
+                "max_gross_exposure_pct": 150.0,
                 "max_orders_per_minute": 10,
                 "decay_ma_window": 200,
             },
@@ -216,21 +217,46 @@ def sign_envelope_ed25519(
     return digest, f"ed25519:{sig_b64}"
 
 
+def _load_ed25519_public_key(
+    key: Ed25519PublicKey | bytes | str,
+) -> Optional[Ed25519PublicKey]:
+    if isinstance(key, Ed25519PublicKey):
+        return key
+    try:
+        pem_bytes = key.encode("utf-8") if isinstance(key, str) else bytes(key)
+        loaded = serialization.load_pem_public_key(pem_bytes)
+        return loaded if isinstance(loaded, Ed25519PublicKey) else None
+    except Exception:
+        return None
+
+
 def verify_envelope_ed25519(
     envelope: "StrategyEnvelope",
-    signature: str,
-    public_key: Ed25519PublicKey,
+    signature: str | bytes | Ed25519PublicKey,
+    public_key: Optional[Ed25519PublicKey | bytes | str] = None,
 ) -> bool:
-    """Verify an ``ed25519:<base64_signature>`` over a StrategyEnvelope's canonical SHA-256 digest."""
-    if not isinstance(signature, str) or not signature.startswith("ed25519:"):
+    """Verify an ``ed25519:<base64_signature>`` over a StrategyEnvelope's canonical SHA-256 digest.
+
+    Supports both ``verify_envelope_ed25519(envelope, signature, public_key)`` and the
+    shorthand ``verify_envelope_ed25519(envelope, authority_public_key_pem)`` which verifies
+    ``envelope.signature_hash`` against the provided Ed25519 public key or PEM bytes.
+    """
+    if public_key is None:
+        resolved_key = _load_ed25519_public_key(signature)
+        sig_str = envelope.signature_hash
+    else:
+        resolved_key = _load_ed25519_public_key(public_key)
+        sig_str = signature if isinstance(signature, str) else ""
+
+    if resolved_key is None or not isinstance(sig_str, str) or not sig_str.startswith("ed25519:"):
         return False
-    sig_b64 = signature[len("ed25519:") :]
+    sig_b64 = sig_str[len("ed25519:") :]
     if not sig_b64:
         return False
     try:
         raw_sig = base64.b64decode(sig_b64.encode("ascii"), validate=True)
         digest = compute_envelope_signature_hash(envelope)
-        public_key.verify(raw_sig, digest.encode("utf-8"))
+        resolved_key.verify(raw_sig, digest.encode("utf-8"))
         return True
     except (InvalidSignature, ValueError):
         return False
@@ -360,10 +386,13 @@ class EnvelopeEvaluator:
         reference_price: Optional[float] = None,
         is_reducing: bool = False,
         current_position_qty: float = 0.0,
+        authority_public_key_pem: Optional[bytes] = None,
+        contract_multiplier: float = 1.0,
     ) -> EnvelopeVerdict:
         """Deterministically evaluate a TradeProposal against a signed StrategyEnvelope.
 
         Checks:
+        - ENVELOPE_INVALID_SIGNATURE (when authority_public_key_pem is provided)
         - ENVELOPE_INACTIVE
         - ENVELOPE_EXPIRED
         - ENVELOPE_SYMBOL_NOT_ALLOWED
@@ -392,6 +421,14 @@ class EnvelopeEvaluator:
             if code not in violation_codes:
                 violation_codes.append(code)
             reasons.append(message)
+
+        # 0. Optional strict Ed25519 authority signature verification (fail-closed)
+        if authority_public_key_pem is not None:
+            if not verify_envelope_ed25519(envelope, authority_public_key_pem):
+                add_violation(
+                    "ENVELOPE_INVALID_SIGNATURE",
+                    f"Strategy envelope '{envelope.envelope_id}' failed Ed25519 signature verification (invalid, tampered, or unsigned).",
+                )
 
         # 1. Active status
         if not envelope.active:
@@ -441,19 +478,24 @@ class EnvelopeEvaluator:
             )
 
         # 5. Per-order and aggregate strategy notional caps
-        # Risk-reducing closes/flattens must NEVER be blocked by notional caps.
+        # Risk-reducing closes/flattens must NEVER be blocked by notional caps,
+        # but is_reducing=True is only honored when open position/notional exists.
         side_str = (
             proposal.side.value.upper()
             if hasattr(proposal.side, "value")
             else str(proposal.side).strip().upper()
         )
         qty = abs(float(proposal.quantity))
+        has_open_exposure = (current_position_qty != 0.0) or (float(current_strategy_notional_usd) > 0.0)
         reducing = (
-            bool(is_reducing)
+            (bool(is_reducing) and has_open_exposure)
             or (current_position_qty > 0 and side_str == "SELL" and qty <= current_position_qty)
             or (current_position_qty < 0 and side_str == "BUY" and qty <= abs(current_position_qty))
         )
         metrics["is_reducing"] = reducing
+
+        multiplier = max(1.0, float(contract_multiplier))
+        metrics["contract_multiplier"] = multiplier
 
         effective_price = proposal.limit_price if proposal.limit_price is not None else reference_price
         if effective_price is None or effective_price <= 0:
@@ -463,7 +505,7 @@ class EnvelopeEvaluator:
                     "Missing positive limit_price or reference_price to verify order notional against envelope cap.",
                 )
         else:
-            order_notional = abs(float(proposal.quantity) * float(effective_price))
+            order_notional = abs(qty * float(effective_price) * multiplier)
             current_notional = max(0.0, float(current_strategy_notional_usd))
             if reducing:
                 projected_strategy_notional = max(0.0, current_notional - order_notional)

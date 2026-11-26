@@ -13,7 +13,7 @@ from clearfills.cli import main as cli_main
 
 
 def test_top_level_exports_and_version() -> None:
-    assert clearfills.__version__ == "0.8.0"
+    assert clearfills.__version__ == "0.8.1"
     assert FirewallService is not None
     assert TradeProposal is not None
     assert PortfolioSnapshot is not None
@@ -25,7 +25,7 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
         cli_main(["--version"])
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
-    assert "clearfills 0.8.0" in captured.out
+    assert "clearfills 0.8.1" in captured.out
 
 
 def test_cli_init_paper_and_live_and_force(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -85,7 +85,7 @@ def test_cli_doctor_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     rc = cli_main(["doctor", "--config", str(cfg), "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["version"] == "0.8.0"
+    assert payload["version"] == "0.8.1"
     assert payload["ok"] is True
     names = [c["name"] for c in payload["checks"]]
     assert names == [

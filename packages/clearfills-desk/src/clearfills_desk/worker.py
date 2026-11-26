@@ -116,6 +116,7 @@ def verify_operator_passkey_cosignature(
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
     current_sign_count: int = 0,
+    current_sign_counts: Optional[dict[str, int]] = None,
 ) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier."""
     return verify_webauthn_assertion(
@@ -125,6 +126,7 @@ def verify_operator_passkey_cosignature(
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
         current_sign_count=current_sign_count,
+        current_sign_counts=current_sign_counts,
     )
 
 
@@ -136,6 +138,7 @@ def verify_local_webauthn_cosign(
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
     current_sign_count: int = 0,
+    current_sign_counts: Optional[dict[str, int]] = None,
 ) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier."""
     return verify_webauthn_assertion(
@@ -145,6 +148,7 @@ def verify_local_webauthn_cosign(
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
         current_sign_count=current_sign_count,
+        current_sign_counts=current_sign_counts,
     )
 
 
@@ -157,6 +161,7 @@ def verify_webauthn_cosignature(
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
     current_sign_count: int = 0,
+    current_sign_counts: Optional[dict[str, int]] = None,
 ) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier.
 
@@ -170,6 +175,7 @@ def verify_webauthn_cosignature(
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
         current_sign_count=current_sign_count,
+        current_sign_counts=current_sign_counts,
     )
 
 
@@ -497,7 +503,7 @@ class ApprovalWorker:
                         "detail": detail,
                     }
 
-            sign_count_key = (extract_credential_id(assertion) if assertion is not None else "") or "__default__"
+            raw_cred_id = extract_credential_id(assertion) if assertion is not None else ""
             try:
                 sign_counts = self._load_passkey_sign_counts()
             except Exception as exc:
@@ -516,14 +522,15 @@ class ApprovalWorker:
                     "detail": detail,
                 }
 
-            current_sign_count = sign_counts.get(sign_count_key, 0)
+            fallback_sign_count = sign_counts.get(raw_cred_id, 0) if raw_cred_id else sign_counts.get("__default__", 0)
             cosign_result = verify_webauthn_assertion(
                 record,
                 combined_pinned_keys,
                 expected_rp_id=self._webauthn_rp_id,
                 expected_origin=self._webauthn_origin,
                 trusted_credential_ids=self._trusted_credential_ids or None,
-                current_sign_count=current_sign_count,
+                current_sign_count=fallback_sign_count,
+                current_sign_counts=sign_counts,
             )
             cosign_ok, cosign_detail = cosign_result
             if cosign_ok and assertion is not None:
@@ -545,7 +552,8 @@ class ApprovalWorker:
                 }
 
             if cosign_result.new_sign_count is not None and not self.dry_run:
-                sign_counts[sign_count_key] = cosign_result.new_sign_count
+                save_key = raw_cred_id or cosign_result.key_fingerprint or "__default__"
+                sign_counts[save_key] = cosign_result.new_sign_count
                 self._save_passkey_sign_counts(sign_counts)
 
         # 3b. Fetch fresh live quote from IBKR.

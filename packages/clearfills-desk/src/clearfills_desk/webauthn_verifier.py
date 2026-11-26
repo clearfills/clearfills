@@ -34,6 +34,7 @@ from typing import Any, Optional
 
 import cbor2
 import webauthn
+from clearfills_firewall.canonical import canonical_json_bytes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from webauthn.helpers import bytes_to_base64url
@@ -62,6 +63,7 @@ class WebAuthnVerificationResult(tuple):
     new_sign_count: Optional[int]
     credential_id: Optional[str]
     user_verified: bool
+    key_fingerprint: Optional[str]
 
     def __new__(
         cls,
@@ -71,6 +73,7 @@ class WebAuthnVerificationResult(tuple):
         new_sign_count: Optional[int] = None,
         credential_id: Optional[str] = None,
         user_verified: bool = False,
+        key_fingerprint: Optional[str] = None,
     ) -> "WebAuthnVerificationResult":
         obj = super().__new__(cls, (bool(verified), str(detail)))
         return obj
@@ -83,12 +86,14 @@ class WebAuthnVerificationResult(tuple):
         new_sign_count: Optional[int] = None,
         credential_id: Optional[str] = None,
         user_verified: bool = False,
+        key_fingerprint: Optional[str] = None,
     ) -> None:
         self.verified = bool(verified)
         self.detail = str(detail)
         self.new_sign_count = new_sign_count
         self.credential_id = credential_id
         self.user_verified = bool(user_verified)
+        self.key_fingerprint = key_fingerprint
 
 
 def _opt_float(value: Any) -> Optional[float]:
@@ -186,12 +191,12 @@ def compute_approval_hash(record: dict[str, Any]) -> str:
             "agent_id": agent_id,
         }
 
-    encoded = json.dumps(canonical_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = canonical_json_bytes(canonical_obj)
     return hashlib.sha256(encoded).hexdigest()
 
 
 def canonical_order_digest(approval: dict[str, Any]) -> str:
-    """Compute RFC 8785 JCS-style canonical SHA-256 hex digest over core order legs."""
+    """Compute RFC 8785 JCS canonical SHA-256 hex digest over core order legs."""
     nested = _nested_order_fields(approval)
     symbol = str(approval.get("symbol") or nested.get("symbol") or "").strip().upper()
     side = str(approval.get("side") or nested.get("side") or "").strip().upper()
@@ -218,12 +223,29 @@ def canonical_order_digest(approval: dict[str, Any]) -> str:
         "symbol": symbol,
         "venue": venue,
     }
-    encoded = json.dumps(
-        canonical_obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+    order_type_raw = (
+        approval.get("order_type") if approval.get("order_type") is not None else nested.get("order_type")
+    )
+    if order_type_raw is not None and str(order_type_raw).strip():
+        canonical_obj["order_type"] = str(order_type_raw).strip().upper()
+
+    account_id_raw = (
+        approval.get("account_id") if approval.get("account_id") is not None else nested.get("account_id")
+    )
+    if account_id_raw is not None and str(account_id_raw).strip():
+        canonical_obj["account_id"] = str(account_id_raw).strip()
+
+    currency_raw = (
+        approval.get("currency") if approval.get("currency") is not None else nested.get("currency")
+    )
+    if currency_raw is not None and str(currency_raw).strip():
+        canonical_obj["currency"] = str(currency_raw).strip().upper()
+
+    tif_raw = approval.get("tif") if approval.get("tif") is not None else nested.get("tif")
+    if tif_raw is not None and str(tif_raw).strip():
+        canonical_obj["tif"] = str(tif_raw).strip().upper()
+
+    encoded = canonical_json_bytes(canonical_obj)
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -332,11 +354,25 @@ def spki_public_key_to_cose(pub_key: ec.EllipticCurvePublicKey | rsa.RSAPublicKe
     raise ValueError(f"Unsupported pinned public key type: {type(pub_key).__name__}")
 
 
+def compute_spki_fingerprint(raw_key: str) -> str:
+    """Compute deterministic SHA-256 hex fingerprint over a PEM or base64 DER SPKI public key."""
+    cleaned = raw_key.strip()
+    if cleaned.startswith("-----BEGIN"):
+        pub = serialization.load_pem_public_key(cleaned.encode("utf-8"))
+    else:
+        pub = serialization.load_der_public_key(_decode_b64_flexible(cleaned))
+    der_bytes = pub.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der_bytes).hexdigest()
+
+
 def _parse_pinned_spki_cose_keys(
     trusted_passkey_spki_b64: list[str],
-) -> list[tuple[str, bytes]]:
-    """Load locally pinned ECDSA P-256 or RSA SPKI keys and convert each to `(key_kind, cose_bytes)`."""
-    parsed: list[tuple[str, bytes]] = []
+) -> list[tuple[str, bytes, str, str]]:
+    """Load locally pinned ECDSA P-256 or RSA SPKI keys -> `(key_kind, cose_bytes, key_fp, raw_key)`."""
+    parsed: list[tuple[str, bytes, str, str]] = []
     for raw_key in trusted_passkey_spki_b64:
         cleaned = raw_key.strip() if isinstance(raw_key, str) else ""
         if not cleaned:
@@ -347,9 +383,19 @@ def _parse_pinned_spki_cose_keys(
             else:
                 pub = serialization.load_der_public_key(_decode_b64_flexible(cleaned))
             if isinstance(pub, ec.EllipticCurvePublicKey) and isinstance(pub.curve, ec.SECP256R1):
-                parsed.append(("ECDSA", spki_public_key_to_cose(pub)))
+                der_bytes = pub.public_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                key_fp = hashlib.sha256(der_bytes).hexdigest()
+                parsed.append(("ECDSA", spki_public_key_to_cose(pub), key_fp, cleaned))
             elif isinstance(pub, rsa.RSAPublicKey):
-                parsed.append(("RSA", spki_public_key_to_cose(pub)))
+                der_bytes = pub.public_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                key_fp = hashlib.sha256(der_bytes).hexdigest()
+                parsed.append(("RSA", spki_public_key_to_cose(pub), key_fp, cleaned))
         except Exception:
             continue
     return parsed
@@ -387,6 +433,7 @@ def verify_webauthn_assertion(
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
     current_sign_count: int = 0,
+    current_sign_counts: Optional[dict[str, int]] = None,
 ) -> WebAuthnVerificationResult:
     """Canonical fail-closed WebAuthn assertion verifier backed by `py_webauthn`.
 
@@ -396,9 +443,23 @@ def verify_webauthn_assertion(
     `require_user_verification=True`, mandatory nonce-bound challenge
     `base64url(sha256(f"{nonce}:{canonical_order_hash}"))`, and monotonic
     `sign_count` rollback protection (`credential_current_sign_count`).
+
+    When multiple passkeys are pinned, pass `current_sign_counts` keyed by
+    `credential_id`, SHA-256 SPKI fingerprint (`compute_spki_fingerprint`), or
+    raw SPKI string so each key enforces its own independent monotonic counter.
     """
     if not isinstance(current_sign_count, int) or isinstance(current_sign_count, bool) or current_sign_count < 0:
         return WebAuthnVerificationResult(False, "current_sign_count must be a non-negative integer.")
+
+    if current_sign_counts is not None:
+        if not isinstance(current_sign_counts, dict):
+            return WebAuthnVerificationResult(False, "current_sign_counts must be a dictionary mapping key IDs to non-negative integers.")
+        for k, v in current_sign_counts.items():
+            if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                return WebAuthnVerificationResult(
+                    False,
+                    "current_sign_counts values must be non-negative integers keyed by strings.",
+                )
 
     pinned_raw = [k.strip() for k in (trusted_passkey_spki_b64 or []) if isinstance(k, str) and k.strip()]
     if not pinned_raw:
@@ -571,7 +632,20 @@ def verify_webauthn_assertion(
     # Delegate full WebAuthn verification (rpIdHash, UP+UV, type, origin, challenge,
     # monotonic sign_count, and cryptographic signature) to py_webauthn against ONLY
     # locally pinned COSE public keys.
-    for key_kind, cose_key_bytes in parsed_cose_keys:
+    sign_count_error: Optional[str] = None
+    for key_kind, cose_key_bytes, key_fp, raw_spki in parsed_cose_keys:
+        if current_sign_counts is not None:
+            if key_fp in current_sign_counts:
+                key_sign_count = current_sign_counts[key_fp]
+            elif raw_spki in current_sign_counts:
+                key_sign_count = current_sign_counts[raw_spki]
+            elif cred_id and cred_id in current_sign_counts:
+                key_sign_count = current_sign_counts[cred_id]
+            else:
+                key_sign_count = current_sign_count
+        else:
+            key_sign_count = current_sign_count
+
         try:
             verified = webauthn.verify_authentication_response(
                 credential=credential,
@@ -579,7 +653,7 @@ def verify_webauthn_assertion(
                 expected_rp_id=rp_id_clean,
                 expected_origin=origin_clean,
                 credential_public_key=cose_key_bytes,
-                credential_current_sign_count=current_sign_count,
+                credential_current_sign_count=key_sign_count,
                 require_user_verification=True,
             )
             return WebAuthnVerificationResult(
@@ -588,10 +662,17 @@ def verify_webauthn_assertion(
                 new_sign_count=verified.new_sign_count,
                 credential_id=cred_id or None,
                 user_verified=verified.user_verified,
+                key_fingerprint=key_fp,
             )
         except InvalidAuthenticationResponse as exc:
             err_msg = str(exc)
-            if "could not verify authentication signature" in err_msg.lower():
+            low_msg = err_msg.lower()
+            if "could not verify authentication signature" in low_msg:
+                continue
+            if "sign count" in low_msg and len(parsed_cose_keys) > 1:
+                # py_webauthn checks sign_count before signature; another pinned key may be the actual signer.
+                if sign_count_error is None:
+                    sign_count_error = err_msg
                 continue
             return WebAuthnVerificationResult(
                 False,
@@ -606,6 +687,16 @@ def verify_webauthn_assertion(
                 False,
                 f"WebAuthn verification error: {exc}",
             )
+
+    if sign_count_error is not None:
+        return WebAuthnVerificationResult(
+            False,
+            _format_webauthn_error(
+                sign_count_error,
+                expected_rp_id=rp_id_clean,
+                expected_origin=origin_clean,
+            ),
+        )
 
     return WebAuthnVerificationResult(
         False,

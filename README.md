@@ -53,6 +53,8 @@ clearfills mcp
 CLEARFILLS_API_KEY="cf_sk_..." clearfills watch --dry-run
 ```
 
+All 12 `clearfills` CLI subcommands: `init`, `doctor`, `mcp`, `watch`, `sync`, `validate`, `redteam`, `benchmark`, `compile-policy`, `serve`, `prove`, and `verify-proof`.
+
 ---
 
 ## How It Works (3 Steps)
@@ -173,7 +175,7 @@ Every decision (`PROPOSAL_APPROVED`, `PROPOSAL_VETOED`, `DISPATCH_ALLOWED`, `DIS
 
 ## Repository Layout
 
-- [`src/clearfills`](src/clearfills/): Unified `clearfills` Python package & CLI (`init`, `doctor`, `mcp`, `watch`, `sync`, `validate`, `redteam`, `serve`).
+- [`src/clearfills`](src/clearfills/): Unified `clearfills` Python package & CLI (`init`, `doctor`, `mcp`, `watch`, `sync`, `validate`, `redteam`, `benchmark`, `compile-policy`, `serve`, `prove`, `verify-proof`).
 - [`packages/risk-firewall`](packages/risk-firewall/): Apache-2.0 `clearfills_firewall`, deterministic policy engine, per-sleeve rules, Ed25519 attestation authority, RFC 8785 JCS hashing, WebAuthn verifier, Strategy Envelopes, SHA-256 audit ledger, MCP stdio and FastAPI server.
 - [`packages/clearfills-desk`](packages/clearfills-desk/): Apache-2.0 `clearfills_desk`, IBKR execution adapter (`whatIf` previews, delayed-quote metadata, multi-agent `clientId` retry), `enclave_client`, `clearfills-desk-mcp`, `clearfills sync`, and `clearfills watch`.
 - [`deploy/isolated-worker/`](deploy/isolated-worker/): Separate-user Docker isolation kit (UID 10001, `0600` state volume, Passkey co-sign enabled by default).
