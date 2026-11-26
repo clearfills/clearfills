@@ -365,14 +365,17 @@ def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_pa
     assert ok is False
     assert "pinned" in reason.lower()
 
+    from clearfills_desk.webauthn_verifier import canonical_order_digest
+
     priv, spki_b64 = _generate_p256_spki()
     nonce = _b64u(b"edge_case_nonce_0000000001")
-    approval_hash = hashlib.sha256(b"SGOV:BUY:100:100.25").hexdigest()
+    base_rec = {"symbol": "SGOV", "side": "BUY", "quantity": 100, "limit_price": 100.25, "venue": "ibkr"}
+    approval_hash = canonical_order_digest(base_rec)
 
     # User Present bit cleared -> rejected
     no_up = _sign_touchid_bundle(priv, challenge_nonce=nonce, approval_hash=approval_hash, up_bit=False)
     ok, reason = verify_operator_passkey_cosignature(
-        {"approval_hash": approval_hash, "passkey_assertion_bundle": no_up},
+        {**base_rec, "approval_hash": approval_hash, "passkey_assertion_bundle": no_up},
         [spki_b64],
     )
     assert ok is False
@@ -386,7 +389,7 @@ def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_pa
         ceremony_type="webauthn.create",
     )
     ok, reason = verify_operator_passkey_cosignature(
-        {"approval_hash": approval_hash, "passkey_assertion_bundle": bad_type},
+        {**base_rec, "approval_hash": approval_hash, "passkey_assertion_bundle": bad_type},
         [spki_b64],
     )
     assert ok is False
@@ -412,6 +415,7 @@ def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_pa
     )
     ok, reason = verify_operator_passkey_cosignature(
         {
+            **base_rec,
             "approval_hash": approval_hash,
             "passkey_assertion": {
                 "challenge": challenge,

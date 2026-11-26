@@ -182,12 +182,11 @@ def _make_transport(record: dict[str, Any], reported: list[dict[str, Any]]):
 
 
 def test_valid_local_p256_cosign_passes_and_submits_to_ibkr(tmp_path: Path) -> None:
+    from clearfills_desk.webauthn_verifier import canonical_order_digest
+
     adapter, fake_ib = _make_adapter(tmp_path)
     priv, spki_b64 = _generate_p256_keypair()
     nonce_b64 = _b64u(b"deterministic_test_nonce_24b")
-    approval_hash = hashlib.sha256(b"SGOV:BUY:200:100.25:ibkr").hexdigest()
-    proof = _sign_order_bound_p256(priv, nonce_b64=nonce_b64, approval_hash=approval_hash)
-
     record = {
         "approval_id": "apr_cosign_ok_001",
         "status": "approved",
@@ -197,9 +196,11 @@ def test_valid_local_p256_cosign_passes_and_submits_to_ibkr(tmp_path: Path) -> N
         "order_type": "LIMIT",
         "quantity": 200,
         "limit_price": 100.25,
-        "approval_hash": approval_hash,
-        "webauthn_proof": proof,
     }
+    approval_hash = canonical_order_digest(record)
+    proof = _sign_order_bound_p256(priv, nonce_b64=nonce_b64, approval_hash=approval_hash)
+    record["approval_hash"] = approval_hash
+    record["webauthn_proof"] = proof
     reported: list[dict[str, Any]] = []
     worker = ApprovalWorker(
         adapter=adapter,
@@ -286,7 +287,7 @@ def test_tampered_approval_hash_fails_closed_cosign_rejected(tmp_path: Path) -> 
     outcomes = worker.poll_once()
     assert len(outcomes) == 1
     assert outcomes[0]["status"] == "cosign_rejected"
-    assert "sha256(nonce:approval_hash)" in outcomes[0]["detail"]
+    assert "fail-closed" in outcomes[0]["detail"] or "sha256(nonce:approval_hash)" in outcomes[0]["detail"]
     assert len(fake_ib.placed) == 0
     assert len(fake_ib.quote_calls) == 0
     assert reported[0]["status"] == "cosign_rejected"
@@ -297,10 +298,9 @@ def test_wrong_signing_key_fails_closed_cosign_rejected(tmp_path: Path) -> None:
     _, trusted_spki_b64 = _generate_p256_keypair()
     attacker_priv, _ = _generate_p256_keypair()
 
-    nonce_b64 = _b64u(b"nonce_for_wrong_key_test_1")
-    approval_hash = hashlib.sha256(b"SGOV:BUY:200:100.25:ibkr").hexdigest()
-    proof = _sign_order_bound_p256(attacker_priv, nonce_b64=nonce_b64, approval_hash=approval_hash)
+    from clearfills_desk.webauthn_verifier import canonical_order_digest
 
+    nonce_b64 = _b64u(b"nonce_for_wrong_key_test_1")
     record = {
         "approval_id": "apr_cosign_wrong_key_001",
         "status": "approved",
@@ -310,9 +310,11 @@ def test_wrong_signing_key_fails_closed_cosign_rejected(tmp_path: Path) -> None:
         "order_type": "LIMIT",
         "quantity": 200,
         "limit_price": 100.25,
-        "approval_hash": approval_hash,
-        "webauthn_proof": proof,
     }
+    approval_hash = canonical_order_digest(record)
+    proof = _sign_order_bound_p256(attacker_priv, nonce_b64=nonce_b64, approval_hash=approval_hash)
+    record["approval_hash"] = approval_hash
+    record["webauthn_proof"] = proof
     reported: list[dict[str, Any]] = []
     worker = ApprovalWorker(
         adapter=adapter,
@@ -331,13 +333,16 @@ def test_wrong_signing_key_fails_closed_cosign_rejected(tmp_path: Path) -> None:
 
 
 def test_verify_local_webauthn_cosign_checks_up_flag_ceremony_and_rsa() -> None:
+    from clearfills_desk.webauthn_verifier import canonical_order_digest
+
     priv, spki_b64 = _generate_p256_keypair()
     nonce_b64 = _b64u(b"nonce_flag_and_rsa_checks")
-    approval_hash = hashlib.sha256(b"VT:BUY:10:120.0:ibkr").hexdigest()
+    base_rec = {"symbol": "VT", "side": "BUY", "quantity": 10, "limit_price": 120.0, "venue": "ibkr"}
+    approval_hash = canonical_order_digest(base_rec)
 
     # Missing UP flag rejected
     no_up_proof = _sign_order_bound_p256(priv, nonce_b64=nonce_b64, approval_hash=approval_hash, up_flag=False)
-    ok, msg = verify_local_webauthn_cosign({"approval_hash": approval_hash, "webauthn_proof": no_up_proof}, [spki_b64])
+    ok, msg = verify_local_webauthn_cosign({**base_rec, "approval_hash": approval_hash, "webauthn_proof": no_up_proof}, [spki_b64])
     assert ok is False
     assert "up" in msg.lower()
 
@@ -346,7 +351,7 @@ def test_verify_local_webauthn_cosign_checks_up_flag_ceremony_and_rsa() -> None:
         priv, nonce_b64=nonce_b64, approval_hash=approval_hash, ceremony_type="webauthn.create"
     )
     ok, msg = verify_local_webauthn_cosign(
-        {"approval_hash": approval_hash, "webauthn_proof": bad_type_proof}, [spki_b64]
+        {**base_rec, "approval_hash": approval_hash, "webauthn_proof": bad_type_proof}, [spki_b64]
     )
     assert ok is False
     assert "webauthn.get" in msg
@@ -366,6 +371,7 @@ def test_verify_local_webauthn_cosign_checks_up_flag_ceremony_and_rsa() -> None:
     ).encode("utf-8")
     sig = rsa_priv.sign(auth_data + hashlib.sha256(client_data).digest(), padding.PKCS1v15(), hashes.SHA256())
     rsa_record = {
+        **base_rec,
         "approval_hash": approval_hash,
         "webauthn_proof": {
             "challenge": challenge,

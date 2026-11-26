@@ -593,18 +593,28 @@ def verify_webauthn_assertion(
         )
     approval_hash = record_hash or bundle_hash
 
-    if approval_hash and _has_canonical_approval_record_fields(record):
-        try:
-            recomputed_hash = compute_approval_hash(record)
-        except Exception as exc:
-            return WebAuthnVerificationResult(
-                False, f"Failed computing canonical approval_hash from order fields: {exc}"
-            )
-        if recomputed_hash != approval_hash:
-            return WebAuthnVerificationResult(
-                False,
-                "Order parameters in approval record do not match approval_hash (tampered order rejected).",
-            )
+    if approval_hash:
+        if _has_canonical_approval_record_fields(record):
+            try:
+                recomputed_hash = compute_approval_hash(record)
+            except Exception as exc:
+                return WebAuthnVerificationResult(
+                    False, f"Failed computing canonical approval_hash from order fields: {exc}"
+                )
+            if recomputed_hash != approval_hash:
+                return WebAuthnVerificationResult(
+                    False,
+                    "Order parameters in approval record do not match approval_hash (tampered order rejected).",
+                )
+        else:
+            # Fail closed: never trust a cloud-supplied approval_hash without verifying order fields
+            fallback_digest = canonical_order_digest(record)
+            recomputed_minimal = compute_approval_hash(record)
+            if approval_hash not in {fallback_digest, recomputed_minimal}:
+                return WebAuthnVerificationResult(
+                    False,
+                    "Missing canonical record fields and approval_hash does not match order digest (fail-closed).",
+                )
 
     valid_challenge_digests: list[bytes] = []
     if approval_hash:
