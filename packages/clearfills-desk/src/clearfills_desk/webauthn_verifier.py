@@ -191,6 +191,23 @@ def compute_approval_hash(record: dict[str, Any]) -> str:
             "agent_id": agent_id,
         }
 
+    optional_bindings = {
+        "account_id": record.get("account_id") or nested.get("account_id"),
+        "currency": record.get("currency") or nested.get("currency"),
+        "tif": (
+            record.get("tif")
+            or record.get("time_in_force")
+            or nested.get("tif")
+            or nested.get("time_in_force")
+        ),
+        "expires_at": record.get("expires_at") or nested.get("expires_at"),
+    }
+    for k, v in optional_bindings.items():
+        if v is not None and str(v).strip() != "":
+            canonical_obj[k] = (
+                v.isoformat() if isinstance(v, datetime) else str(v).strip()
+            )
+
     encoded = canonical_json_bytes(canonical_obj)
     return hashlib.sha256(encoded).hexdigest()
 
