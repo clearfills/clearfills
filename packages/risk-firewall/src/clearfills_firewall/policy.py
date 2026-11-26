@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -22,6 +25,7 @@ from .models import (
     VenueType,
     utc_now,
 )
+from .providers import PortfolioProvider
 
 
 class SleevePolicy(BaseModel):
@@ -38,6 +42,8 @@ class SleevePolicy(BaseModel):
     max_risk_per_trade_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
     max_total_heat_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
     max_gross_exposure_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
+    max_position_concentration_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    max_daily_cumulative_notional_usd: Optional[float] = Field(default=None, gt=0.0)
     exempt_session_entry_cap: bool = Field(default=False)
     exempt_last_session_of_week: bool = Field(default=False)
     exempt_session_cutoff: bool = Field(default=False)
@@ -53,6 +59,8 @@ def default_allocation_sleeves() -> dict[str, SleevePolicy]:
             symbols=["SGOV", "BIL", "CBIL", "SHV", "USFR", "TFLO"],
             require_stop_loss=False,
             max_order_notional_usd=500_000.0,
+            max_position_concentration_pct=100.0,
+            max_daily_cumulative_notional_usd=1_000_000.0,
             exempt_session_entry_cap=True,
             exempt_last_session_of_week=True,
             exempt_session_cutoff=True,
@@ -61,6 +69,8 @@ def default_allocation_sleeves() -> dict[str, SleevePolicy]:
             symbols=["VT", "VTI", "VOO", "SPY", "QQQ", "VEQT", "VBAL", "XEQT", "VXUS", "BND"],
             require_stop_loss=False,
             max_order_notional_usd=500_000.0,
+            max_position_concentration_pct=100.0,
+            max_daily_cumulative_notional_usd=1_000_000.0,
             exempt_session_entry_cap=True,
             exempt_last_session_of_week=True,
             exempt_session_cutoff=True,
@@ -74,12 +84,16 @@ class RiskPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     policy_version: str = Field(default="1.0.0")
-    max_risk_per_trade_pct: float = Field(default=1.0, gt=0.0, le=100.0)
+    max_risk_per_trade_pct: float = Field(default=1.5, gt=0.0, le=100.0)
     max_open_positions: int = Field(default=10, ge=1)
     max_total_heat_pct: float = Field(default=8.0, gt=0.0, le=100.0)
-    max_daily_loss_pct: float = Field(default=2.0, gt=0.0, le=100.0)
+    max_daily_loss_pct: float = Field(default=3.0, gt=0.0, le=100.0)
     require_stop_loss: bool = Field(default=True)
     max_order_notional_usd: float = Field(default=50_000.0, gt=0.0)
+    max_position_concentration_pct: float = Field(default=20.0, gt=0.0, le=100.0)
+    max_daily_cumulative_notional_usd: float = Field(default=200_000.0, gt=0.0)
+    max_orders_per_minute: int = Field(default=10, ge=1)
+    max_snapshot_age_seconds: float = Field(default=30.0, gt=0.0)
     allowed_venues: list[str] = Field(
         default_factory=lambda: ["ibkr", "alpaca", "polymarket", "kalshi", "paper"]
     )
@@ -91,6 +105,7 @@ class RiskPolicy(BaseModel):
     fractional_kelly_multiplier: float = Field(default=0.25, gt=0.0, le=1.0)
     max_kelly_confidence: float = Field(default=0.75, gt=0.0, le=1.0)
     enforce_kelly_sizing: bool = Field(default=True)
+    enforce_trusted_kelly: bool = Field(default=True)
     max_entries_per_session: Optional[int] = Field(default=None, ge=1)
     block_last_session_of_week: bool = Field(default=False)
     no_entries_after_et: Optional[str] = Field(default=None)
@@ -176,6 +191,9 @@ def evaluate_proposal(
     portfolio: PortfolioSnapshot,
     policy: RiskPolicy,
     kill_switch: KillSwitch,
+    *,
+    daily_cumulative_notional_usd: float = 0.0,
+    recent_order_count_1m: int = 0,
 ) -> RiskDecision:
     """Deterministically evaluate a trade proposal against policy, portfolio, and kill switch.
 
@@ -207,6 +225,16 @@ def evaluate_proposal(
         sleeve.max_gross_exposure_pct
         if (sleeve is not None and sleeve.max_gross_exposure_pct is not None)
         else policy.max_gross_exposure_pct
+    )
+    eff_max_concentration_pct = (
+        sleeve.max_position_concentration_pct
+        if (sleeve is not None and sleeve.max_position_concentration_pct is not None)
+        else policy.max_position_concentration_pct
+    )
+    eff_max_daily_cumulative_notional = (
+        sleeve.max_daily_cumulative_notional_usd
+        if (sleeve is not None and sleeve.max_daily_cumulative_notional_usd is not None)
+        else policy.max_daily_cumulative_notional_usd
     )
     eff_allow_shorting = (
         sleeve.allow_shorting
@@ -240,6 +268,8 @@ def evaluate_proposal(
         "daily_loss_pct": round(portfolio.daily_loss_pct, 4),
         "current_heat_pct": round(effective_heat_pct, 4),
         "raw_portfolio_heat_pct": round(portfolio.current_heat_pct, 4),
+        "daily_cumulative_notional_usd": round(daily_cumulative_notional_usd, 4),
+        "recent_orders_1m": recent_order_count_1m,
     }
 
     def add_veto(code: str, message: str) -> None:
@@ -405,6 +435,36 @@ def evaluate_proposal(
                     f"Projected gross exposure {projected_gross_pct:.2f}% exceeds max_gross_exposure_pct {eff_max_gross_pct:.2f}% (sleeve={sleeve_name})",
                 )
 
+        # 8c. Single-position concentration cap (allow risk-reducing closes)
+        if not is_reducing_position:
+            existing_symbol_notional = portfolio.held_notional_usd(proposal.symbol)
+            projected_concentration_pct = (
+                (existing_symbol_notional + order_notional_usd) / portfolio.nav_usd
+            ) * 100.0
+            metrics["projected_position_concentration_pct"] = round(projected_concentration_pct, 4)
+            if projected_concentration_pct > eff_max_concentration_pct + 1e-9:
+                add_veto(
+                    "MAX_POSITION_CONCENTRATION_EXCEEDED",
+                    f"Projected {prop_sym} concentration {projected_concentration_pct:.2f}% exceeds max_position_concentration_pct {eff_max_concentration_pct:.2f}% (sleeve={sleeve_name})",
+                )
+
+        # 8d. Cumulative daily notional cap (anti-salami-slicing; allow risk-reducing closes)
+        if not is_reducing_position:
+            projected_daily_notional = daily_cumulative_notional_usd + order_notional_usd
+            metrics["projected_daily_cumulative_notional_usd"] = round(projected_daily_notional, 4)
+            if projected_daily_notional > eff_max_daily_cumulative_notional + 1e-6:
+                add_veto(
+                    "MAX_DAILY_CUMULATIVE_NOTIONAL_EXCEEDED",
+                    f"Projected daily cumulative notional ${projected_daily_notional:,.2f} exceeds max_daily_cumulative_notional_usd ${eff_max_daily_cumulative_notional:,.2f} (sleeve={sleeve_name})",
+                )
+
+        # 8e. Sliding 60-second order rate limit (allow risk-reducing closes)
+        if not is_reducing_position and recent_order_count_1m >= policy.max_orders_per_minute:
+            add_veto(
+                "ORDER_RATE_EXCEEDED",
+                f"Order rate ({recent_order_count_1m} orders in last 60s) reached max_orders_per_minute ({policy.max_orders_per_minute})",
+            )
+
         # 9. Stop-loss validation & stop-distance risk computation
         is_pm = _is_prediction_market(proposal)
         stop_distance: Optional[float] = None
@@ -476,8 +536,14 @@ def evaluate_proposal(
                     q = 1.0 - p
                     full_kelly = (p * payoff_ratio - q) / payoff_ratio
                     fractional_kelly = max(0.0, full_kelly * policy.fractional_kelly_multiplier)
-                    kelly_risk_cap_pct = fractional_kelly * 100.0
-                    kelly_max_qty = (portfolio.nav_usd * fractional_kelly) / stop_distance
+                    raw_kelly_risk_cap_pct = fractional_kelly * 100.0
+                    # Cap untrusted caller confidence so Kelly sizing can never exceed max_risk_per_trade_pct
+                    kelly_risk_cap_pct = (
+                        min(raw_kelly_risk_cap_pct, eff_max_risk_pct)
+                        if policy.enforce_trusted_kelly
+                        else raw_kelly_risk_cap_pct
+                    )
+                    kelly_max_qty = (portfolio.nav_usd * (kelly_risk_cap_pct / 100.0)) / stop_distance
 
                     metrics["effective_kelly_confidence"] = round(p, 4)
                     metrics["payoff_ratio"] = round(payoff_ratio, 4)
@@ -518,3 +584,181 @@ def evaluate_proposal(
         metrics=metrics,
         evaluated_at=utc_now(),
     )
+
+
+class RiskFirewall:
+    """Stateful deterministic pre-trade risk firewall with trusted clock, provider, and rate/notional tracking."""
+
+    def __init__(
+        self,
+        *,
+        policy: RiskPolicy,
+        kill_switch: KillSwitch,
+        portfolio_provider: Optional[PortfolioProvider] = None,
+        max_snapshot_age_seconds: Optional[float] = None,
+        enforce_server_clock: bool = False,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self.policy = policy
+        self.kill_switch = kill_switch
+        self.portfolio_provider = portfolio_provider
+        self._max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.enforce_server_clock = enforce_server_clock
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._daily_notional_by_day: dict[str, float] = {}
+        self._recent_order_timestamps: deque[float] = deque()
+
+    @property
+    def max_snapshot_age_seconds(self) -> float:
+        if self._max_snapshot_age_seconds is not None:
+            return self._max_snapshot_age_seconds
+        return self.policy.max_snapshot_age_seconds
+
+    def now(self) -> datetime:
+        """Return the authoritative server UTC timestamp."""
+        return self._clock().astimezone(timezone.utc)
+
+    def _prune_rate_window_locked(self, now_ts: float) -> None:
+        cutoff = now_ts - 60.0
+        while self._recent_order_timestamps and self._recent_order_timestamps[0] <= cutoff:
+            self._recent_order_timestamps.popleft()
+
+    def daily_cumulative_notional_usd(self, now: Optional[datetime] = None) -> float:
+        day_key = (now or self.now()).astimezone(timezone.utc).date().isoformat()
+        with self._lock:
+            return self._daily_notional_by_day.get(day_key, 0.0)
+
+    def recent_order_count_1m(self, now: Optional[datetime] = None) -> int:
+        now_ts = (now or self.now()).astimezone(timezone.utc).timestamp()
+        with self._lock:
+            self._prune_rate_window_locked(now_ts)
+            return len(self._recent_order_timestamps)
+
+    def record_approved_order(
+        self,
+        proposal: TradeProposal,
+        *,
+        is_reducing_position: bool = False,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Record an approved order into the UTC-day notional accumulator and 60s rate window."""
+        eval_now = (now or self.now()).astimezone(timezone.utc)
+        now_ts = eval_now.timestamp()
+        day_key = eval_now.date().isoformat()
+        notional = (
+            proposal.quantity * proposal.limit_price
+            if (proposal.limit_price is not None and proposal.limit_price > 0)
+            else 0.0
+        )
+        with self._lock:
+            self._prune_rate_window_locked(now_ts)
+            if not is_reducing_position:
+                self._recent_order_timestamps.append(now_ts)
+                if notional > 0:
+                    self._daily_notional_by_day[day_key] = (
+                        self._daily_notional_by_day.get(day_key, 0.0) + notional
+                    )
+
+    def resolve_portfolio(
+        self,
+        caller_portfolio: Optional[PortfolioSnapshot] = None,
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[Optional[PortfolioSnapshot], Optional[tuple[str, str]], dict[str, Any]]:
+        """Resolve authoritative portfolio snapshot and verify freshness when a provider is configured."""
+        eval_now = (now or self.now()).astimezone(timezone.utc)
+        meta: dict[str, Any] = {}
+
+        if self.portfolio_provider is not None:
+            meta["portfolio_source"] = "trusted_provider"
+            try:
+                snapshot = self.portfolio_provider.get_snapshot()
+            except Exception as exc:
+                return (
+                    None,
+                    ("STALE_PORTFOLIO_SNAPSHOT", f"Trusted portfolio provider failed: {type(exc).__name__}: {exc}"),
+                    meta,
+                )
+            age_seconds = (eval_now - snapshot.timestamp.astimezone(timezone.utc)).total_seconds()
+            meta["portfolio_snapshot_age_seconds"] = round(age_seconds, 4)
+            if age_seconds > self.max_snapshot_age_seconds or age_seconds < -5.0:
+                return (
+                    snapshot,
+                    (
+                        "STALE_PORTFOLIO_SNAPSHOT",
+                        f"Portfolio snapshot age ({age_seconds:.2f}s) exceeds max_snapshot_age_seconds ({self.max_snapshot_age_seconds:.2f}s)",
+                    ),
+                    meta,
+                )
+            return snapshot, None, meta
+
+        meta["portfolio_source"] = "caller_supplied"
+        if caller_portfolio is None:
+            return (
+                None,
+                ("MISSING_PORTFOLIO_SNAPSHOT", "Portfolio snapshot is required when no trusted PortfolioProvider is configured"),
+                meta,
+            )
+        return caller_portfolio, None, meta
+
+    def evaluate_proposal(
+        self,
+        proposal: TradeProposal,
+        portfolio: Optional[PortfolioSnapshot] = None,
+        *,
+        now: Optional[datetime] = None,
+        record_approval: bool = True,
+        force_server_clock: bool = False,
+    ) -> RiskDecision:
+        """Evaluate a proposal enforcing trusted clock, trusted portfolio provider, concentration, daily notional, and rate caps."""
+        eval_now = (now or self.now()).astimezone(timezone.utc)
+        effective_proposal = (
+            proposal.model_copy(update={"created_at": eval_now})
+            if (self.enforce_server_clock or force_server_clock)
+            else proposal
+        )
+
+        resolved_portfolio, provider_err, meta = self.resolve_portfolio(portfolio, now=eval_now)
+        if provider_err is not None:
+            code, reason = provider_err
+            return RiskDecision(
+                proposal_id=effective_proposal.proposal_id,
+                status=DecisionStatus.VETOED,
+                approved=False,
+                reason_codes=[code],
+                reasons=[reason],
+                metrics={"policy_version": self.policy.policy_version, **meta},
+                evaluated_at=eval_now,
+            )
+
+        assert resolved_portfolio is not None
+        day_key = eval_now.date().isoformat()
+        now_ts = eval_now.timestamp()
+
+        with self._lock:
+            self._prune_rate_window_locked(now_ts)
+            cum_notional = self._daily_notional_by_day.get(day_key, 0.0)
+            recent_count = len(self._recent_order_timestamps)
+
+        decision = evaluate_proposal(
+            proposal=effective_proposal,
+            portfolio=resolved_portfolio,
+            policy=self.policy,
+            kill_switch=self.kill_switch,
+            daily_cumulative_notional_usd=cum_notional,
+            recent_order_count_1m=recent_count,
+        )
+        decision.metrics.update(meta)
+        decision.evaluated_at = eval_now
+
+        if decision.approved and record_approval:
+            held_qty = resolved_portfolio.held_quantity(effective_proposal.symbol)
+            is_reducing = effective_proposal.side == Side.SELL and held_qty >= effective_proposal.quantity
+            self.record_approved_order(
+                effective_proposal,
+                is_reducing_position=is_reducing,
+                now=eval_now,
+            )
+
+        return decision

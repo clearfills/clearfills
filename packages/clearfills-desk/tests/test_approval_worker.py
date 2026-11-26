@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from clearfills_desk import (
     ApprovalWorker,
@@ -16,9 +20,52 @@ from clearfills_desk import (
     DeskRuntime,
     IBKRConnectionConfig,
     IBKRExecutionAdapter,
+    canonical_order_digest,
 )
 from clearfills_desk.cli import main as cli_main
 from clearfills_firewall import RiskPolicy, default_allocation_sleeves
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _gen_test_passkey() -> tuple[ec.EllipticCurvePrivateKey, str]:
+    priv = ec.generate_private_key(ec.SECP256R1())
+    spki_der = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return priv, _b64u(spki_der)
+
+
+def _attach_valid_cosign(
+    record: dict[str, Any],
+    priv: ec.EllipticCurvePrivateKey,
+    *,
+    nonce: str = "test_worker_nonce_0001",
+) -> dict[str, Any]:
+    order_hash = canonical_order_digest(record)
+    challenge = _b64u(hashlib.sha256(f"{nonce}:{order_hash}".encode("utf-8")).digest())
+    auth_data = hashlib.sha256(b"clearfills.com").digest() + bytes([0x05]) + (1).to_bytes(4, "big")
+    client_data = json.dumps(
+        {
+            "type": "webauthn.get",
+            "challenge": challenge,
+            "origin": "https://clearfills.com",
+        }
+    ).encode("utf-8")
+    sig = priv.sign(auth_data + hashlib.sha256(client_data).digest(), ec.ECDSA(hashes.SHA256()))
+    enriched = dict(record)
+    enriched["webauthn_proof"] = {
+        "credential_id": "cred_worker_test_01",
+        "challenge": challenge,
+        "challenge_nonce": nonce,
+        "authenticator_data": _b64u(auth_data),
+        "client_data_json": _b64u(client_data),
+        "signature": _b64u(sig),
+    }
+    return enriched
 
 
 class _FakeIB:
@@ -105,12 +152,14 @@ def _make_adapter(
     bid: float = 100.20,
     ask: float = 100.25,
     last: float = 100.22,
+    operator_passkey_spki_b64: list[str] | None = None,
 ) -> tuple[IBKRExecutionAdapter, _FakeIB]:
     cfg = DeskConfig(
         desk_id="live-worker-desk",
         desk_name="ClearFills Live Worker Desk",
         execution_mode="live",
         human_confirm_above_usd=25_000.0,
+        operator_passkey_spki_b64=operator_passkey_spki_b64 or [],
         ibkr=IBKRConnectionConfig(
             host="127.0.0.1",
             port=4001,
@@ -135,27 +184,37 @@ def _make_adapter(
 
 
 def test_happy_path_approved_ibkr_order_claimed_attested_and_executed(tmp_path: Path) -> None:
-    adapter, fake_ib = _make_adapter(tmp_path, bid=100.20, ask=100.30, last=100.25)
+    priv, spki_b64 = _gen_test_passkey()
+    adapter, fake_ib = _make_adapter(
+        tmp_path,
+        bid=100.20,
+        ask=100.30,
+        last=100.25,
+        operator_passkey_spki_b64=[spki_b64],
+    )
     calls: list[tuple[str, str, Any]] = []
+    approved_rec = _attach_valid_cosign(
+        {
+            "approval_id": "apr_live_001",
+            "status": "approved",
+            "venue": "ibkr",
+            "symbol": "SGOV",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 300,
+            "limit_price": 100.25,
+            "agent_id": "allocator-agent",
+        },
+        priv,
+        nonce="happy_path_nonce_01",
+    )
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
         if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
             return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
-            return [
-                {
-                    "approval_id": "apr_live_001",
-                    "status": "approved",
-                    "venue": "ibkr",
-                    "symbol": "SGOV",
-                    "side": "BUY",
-                    "order_type": "LIMIT",
-                    "quantity": 300,
-                    "limit_price": 100.25,
-                    "agent_id": "allocator-agent",
-                }
-            ]
+            return [approved_rec]
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_live_001/claim":
             return {"approval_id": "apr_live_001", "claimed": True}
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_live_001/executed":
@@ -176,7 +235,9 @@ def test_happy_path_approved_ibkr_order_claimed_attested_and_executed(tmp_path: 
     assert out["symbol"] == "SGOV"
     assert out["status"] == "submitted"
     assert out["broker_order_id"] == "7001"
-    assert out["fill_price"] == pytest.approx(100.30)
+    assert out["quoted_reference_price"] == pytest.approx(100.30)
+    assert out["fill_price"] is None
+    assert out["actual_fill_price"] is None
     assert out["attestation_id"]
     assert out["receipt"]["symbol"] == "SGOV"
     assert out["receipt"]["order_ids"] == [7001]
@@ -203,32 +264,44 @@ def test_happy_path_approved_ibkr_order_claimed_attested_and_executed(tmp_path: 
     exec_body = calls[3][2]
     assert exec_body["status"] == "submitted"
     assert exec_body["broker_order_id"] == "7001"
-    assert exec_body["fill_price"] == pytest.approx(100.30)
+    assert exec_body["quoted_reference_price"] == pytest.approx(100.30)
+    assert exec_body["fill_price"] is None
+    assert exec_body["actual_fill_price"] is None
     assert exec_body["receipt"]["attestation_id"] == out["attestation_id"]
 
 
 def test_slippage_guard_fails_closed_and_reports_slippage_rejected(tmp_path: Path) -> None:
     # Approved limit is 100.00, fresh ask jumped to 101.20 (+120 bps > 50 bps max)
-    adapter, fake_ib = _make_adapter(tmp_path, bid=101.10, ask=101.20, last=101.15)
+    priv, spki_b64 = _gen_test_passkey()
+    adapter, fake_ib = _make_adapter(
+        tmp_path,
+        bid=101.10,
+        ask=101.20,
+        last=101.15,
+        operator_passkey_spki_b64=[spki_b64],
+    )
     calls: list[tuple[str, str, Any]] = []
+    slip_rec = _attach_valid_cosign(
+        {
+            "approval_id": "apr_slip_002",
+            "status": "approved",
+            "venue": "ibkr",
+            "symbol": "SGOV",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 100,
+            "limit_price": 100.00,
+        },
+        priv,
+        nonce="slip_nonce_02",
+    )
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
         if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
             return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
-            return [
-                {
-                    "approval_id": "apr_slip_002",
-                    "status": "approved",
-                    "venue": "ibkr",
-                    "symbol": "SGOV",
-                    "side": "BUY",
-                    "order_type": "LIMIT",
-                    "quantity": 100,
-                    "limit_price": 100.00,
-                }
-            ]
+            return [slip_rec]
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_slip_002/claim":
             return {"claimed": True}
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_slip_002/executed":
@@ -331,26 +404,36 @@ def test_non_ibkr_venue_clearfills_sandbox_is_ignored(tmp_path: Path) -> None:
 
 
 def test_dry_run_validates_and_attests_without_ibkr_submit(tmp_path: Path) -> None:
-    adapter, fake_ib = _make_adapter(tmp_path, bid=100.22, ask=100.26, last=100.24)
+    priv, spki_b64 = _gen_test_passkey()
+    adapter, fake_ib = _make_adapter(
+        tmp_path,
+        bid=100.22,
+        ask=100.26,
+        last=100.24,
+        operator_passkey_spki_b64=[spki_b64],
+    )
     calls: list[tuple[str, str, Any]] = []
+    dry_rec = _attach_valid_cosign(
+        {
+            "approval_id": "apr_dry_005",
+            "status": "approved",
+            "venue": "ibkr",
+            "symbol": "SGOV",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 200,
+            "limit_price": 100.25,
+        },
+        priv,
+        nonce="dry_run_nonce_05",
+    )
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
         if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
             return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
-            return [
-                {
-                    "approval_id": "apr_dry_005",
-                    "status": "approved",
-                    "venue": "ibkr",
-                    "symbol": "SGOV",
-                    "side": "BUY",
-                    "order_type": "LIMIT",
-                    "quantity": 200,
-                    "limit_price": 100.25,
-                }
-            ]
+            return [dry_rec]
         raise AssertionError(f"Dry run should not mutate cloud state: {method} {path}")
 
     worker = ApprovalWorker(
@@ -374,27 +457,37 @@ def test_dry_run_validates_and_attests_without_ibkr_submit(tmp_path: Path) -> No
 
 
 def test_firewall_denied_when_kill_switch_tripped(tmp_path: Path) -> None:
-    adapter, fake_ib = _make_adapter(tmp_path, bid=100.20, ask=100.25, last=100.22)
+    priv, spki_b64 = _gen_test_passkey()
+    adapter, fake_ib = _make_adapter(
+        tmp_path,
+        bid=100.20,
+        ask=100.25,
+        last=100.22,
+        operator_passkey_spki_b64=[spki_b64],
+    )
     adapter.runtime.firewall.kill_switch.trip(actor="operator", reason="operator emergency halt")
     calls: list[tuple[str, str, Any]] = []
+    ks_rec = _attach_valid_cosign(
+        {
+            "approval_id": "apr_ks_006",
+            "status": "approved",
+            "venue": "ibkr",
+            "symbol": "SGOV",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 100,
+            "limit_price": 100.25,
+        },
+        priv,
+        nonce="ks_nonce_06",
+    )
 
     def fake_transport(method: str, path: str, body: Any) -> Any:
         calls.append((method, path, body))
         if method == "POST" and path == "/api/v1/cloud/worker/heartbeat":
             return {"ok": True}
         if method == "GET" and path == "/api/v1/cloud/approvals?status=approved":
-            return [
-                {
-                    "approval_id": "apr_ks_006",
-                    "status": "approved",
-                    "venue": "ibkr",
-                    "symbol": "SGOV",
-                    "side": "BUY",
-                    "order_type": "LIMIT",
-                    "quantity": 100,
-                    "limit_price": 100.25,
-                }
-            ]
+            return [ks_rec]
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_ks_006/claim":
             return {"claimed": True}
         if method == "POST" and path == "/api/v1/cloud/approvals/apr_ks_006/executed":

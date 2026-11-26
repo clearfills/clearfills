@@ -119,6 +119,9 @@ class ExecutionReceipt(BaseModel):
     order_ids: list[int] = Field(default_factory=list)
     attestation_id: str
     submitted_at: str
+    broker_status: str = "Submitted"
+    filled_qty: float = 0.0
+    avg_fill_price: float | None = None
 
 
 class _IBClientProtocol(Protocol):
@@ -356,7 +359,9 @@ class IBKRExecutionAdapter:
 
         nav_usd = 0.0
         buying_power_usd = 0.0
-        daily_pnl_usd = 0.0
+        realized_pnl: float | None = None
+        unrealized_pnl: float | None = None
+        reported_daily_pnl: float | None = None
         accrued_cash_usd = 0.0
         cash_by_currency: dict[str, float] = {}
         settled_by_currency: dict[str, float] = {}
@@ -369,8 +374,12 @@ class IBKRExecutionAdapter:
                 nav_usd = val
             elif tag == "BuyingPower" and ccy in {"USD", "BASE", ""}:
                 buying_power_usd = val
-            elif tag in {"RealizedPnL", "DailyPnL"} and ccy in {"USD", "BASE", ""}:
-                daily_pnl_usd = val
+            elif tag == "RealizedPnL" and ccy in {"USD", "BASE", ""}:
+                realized_pnl = val
+            elif tag == "UnrealizedPnL" and ccy in {"USD", "BASE", ""}:
+                unrealized_pnl = val
+            elif tag == "DailyPnL" and ccy in {"USD", "BASE", ""}:
+                reported_daily_pnl = val
             elif tag == "AccruedCash" and ccy in {"USD", "BASE", ""}:
                 accrued_cash_usd = val
             elif tag == "TotalCashBalance" and ccy and ccy != "BASE":
@@ -411,6 +420,27 @@ class IBKRExecutionAdapter:
                 }
             )
 
+        positions_unrealized_pnl = sum(float(p["unrealized_pnl"]) for p in positions)
+        effective_realized_pnl = realized_pnl if realized_pnl is not None else 0.0
+        effective_unrealized_pnl = (
+            unrealized_pnl if unrealized_pnl is not None else positions_unrealized_pnl
+        )
+        if realized_pnl is not None or unrealized_pnl is not None:
+            mtm_pnl = effective_realized_pnl + effective_unrealized_pnl
+            daily_pnl_usd = (
+                min(reported_daily_pnl, mtm_pnl)
+                if reported_daily_pnl is not None
+                else mtm_pnl
+            )
+        elif reported_daily_pnl is not None:
+            daily_pnl_usd = (
+                min(reported_daily_pnl, positions_unrealized_pnl)
+                if positions_unrealized_pnl < 0.0
+                else reported_daily_pnl
+            )
+        else:
+            daily_pnl_usd = positions_unrealized_pnl
+
         open_orders = self.list_open_orders()
         return {
             "execution_mode": self._mode,
@@ -422,6 +452,8 @@ class IBKRExecutionAdapter:
             "cash_by_currency": {k: round(v, 2) for k, v in sorted(cash_by_currency.items())},
             "buying_power_usd": round(buying_power_usd, 2),
             "accrued_interest_usd": round(accrued_cash_usd, 2),
+            "realized_pnl_usd": round(effective_realized_pnl, 2),
+            "unrealized_pnl_usd": round(effective_unrealized_pnl, 2),
             "daily_pnl_usd": round(daily_pnl_usd, 2),
             "positions": positions,
             "open_orders": open_orders,
@@ -759,6 +791,9 @@ class IBKRExecutionAdapter:
 
         order_ids: list[int] = []
         parent_id: int | None = None
+        broker_status = "Submitted"
+        filled_qty = 0.0
+        avg_fill_price: float | None = None
         for idx, order in enumerate(orders):
             if idx > 0 and parent_id is not None:
                 if isinstance(order, dict):
@@ -769,6 +804,16 @@ class IBKRExecutionAdapter:
             oid = int(getattr(getattr(trade, "order", None), "orderId", idx + 1))
             if idx == 0:
                 parent_id = oid
+                order_status = getattr(trade, "orderStatus", None)
+                if order_status is not None:
+                    raw_status = str(getattr(order_status, "status", "") or "").strip()
+                    if raw_status:
+                        broker_status = raw_status
+                    reported_filled = _safe_float(getattr(order_status, "filled", 0.0), 0.0)
+                    reported_avg = _safe_float(getattr(order_status, "avgFillPrice", 0.0), 0.0)
+                    if reported_filled > 0.0 and reported_avg > 0.0:
+                        filled_qty = reported_filled
+                        avg_fill_price = reported_avg
             order_ids.append(oid)
 
         return ExecutionReceipt(
@@ -784,4 +829,7 @@ class IBKRExecutionAdapter:
             order_ids=order_ids,
             attestation_id=attestation.attestation_id,
             submitted_at=datetime.now(timezone.utc).isoformat(),
+            broker_status=broker_status,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_fill_price,
         )

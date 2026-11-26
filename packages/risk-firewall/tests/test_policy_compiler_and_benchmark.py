@@ -165,9 +165,10 @@ def test_compile_default_nav_warning_and_overlap_fail_closed() -> None:
 def test_run_safety_benchmark_25_scenarios() -> None:
     report = run_safety_benchmark()
 
-    assert report.total_scenarios == 25
-    assert report.attacks_total == 20
-    assert report.attacks_blocked == 20
+    assert report.suite_title == "Policy Regression & Bypass Suite"
+    assert report.total_scenarios == 29
+    assert report.attacks_total == 24
+    assert report.attacks_blocked == 24
     assert report.block_rate_pct == 100.0
     assert report.legit_total == 5
     assert report.legit_approved == 5
@@ -176,7 +177,7 @@ def test_run_safety_benchmark_25_scenarios() -> None:
     assert report.p99_latency_ms >= 0.0
     assert report.audit_chain_valid is True
     assert report.audit_entry_count > 0
-    assert len(report.results) == 25
+    assert len(report.results) == 29
     assert all(r.passed for r in report.results)
 
     by_id = {r.scenario_id: r for r in report.results}
@@ -198,6 +199,11 @@ def test_run_safety_benchmark_25_scenarios() -> None:
         c in {"ATTESTATION_REPLAY_DETECTED", "NONCE_ALREADY_SPENT"}
         for c in by_id["RI-05"].reason_codes
     )
+    assert "LAST_SESSION_OF_WEEK_BLOCKED" in by_id["SB-01"].reason_codes
+    assert "SESSION_CUTOFF_EXCEEDED" in by_id["SB-01"].reason_codes
+    assert "MAX_POSITION_CONCENTRATION_EXCEEDED" in by_id["SB-02"].reason_codes
+    assert "MAX_DAILY_CUMULATIVE_NOTIONAL_EXCEEDED" in by_id["SB-03"].reason_codes
+    assert "RFC8785_NON_FINITE_REJECTED" in by_id["SB-04"].reason_codes
 
     for ok_id in ("OK-01", "OK-02", "OK-03", "OK-04", "OK-05"):
         assert by_id[ok_id].actual_outcome == "APPROVED"
@@ -209,15 +215,16 @@ def test_cli_benchmark_text_and_json(capsys) -> None:
     rc_text = cli_main(["benchmark"])
     assert rc_text == 0
     out_text = capsys.readouterr().out
-    assert "20/20 (100.0%)" in out_text
+    assert "24/24 (100.0%)" in out_text
     assert "5/5 (0.0% false positives)" in out_text
     assert "p99" in out_text
 
     rc_json = cli_main(["benchmark", "--json"])
     assert rc_json == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["total_scenarios"] == 25
-    assert payload["attacks_blocked"] == 20
+    assert payload["suite_title"] == "Policy Regression & Bypass Suite"
+    assert payload["total_scenarios"] == 29
+    assert payload["attacks_blocked"] == 24
     assert payload["legit_approved"] == 5
     assert payload["block_rate_pct"] == 100.0
     assert payload["false_positive_rate_pct"] == 0.0

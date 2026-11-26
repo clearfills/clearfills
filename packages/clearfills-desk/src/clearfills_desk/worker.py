@@ -1,19 +1,20 @@
 """Approval worker bridging ClearFills Cloud 1-Tap approvals to live/paper IBKR execution.
 
-Solves the 3.5-minute preview attestation TTL expiry:
-When an operator approves a trade on ClearFills Cloud (even hours after the original
-preview attestation expired), `ApprovalWorker` polls for approved IBKR orders,
-atomically claims each order, fetches a fresh live quote, validates slippage against
-the approved limit price, re-evaluates the live portfolio through `clearfills-firewall`
-to mint a fresh single-use Ed25519 attestation, submits the order via
-`IBKRExecutionAdapter.submit_attested_order`, and reports the broker receipt back to
-ClearFills Cloud.
+Security hardening guarantees:
+- Single canonical WebAuthn verifier (`webauthn_verifier.py`) with pinned SPKI keys,
+  strict `rpIdHash`, `origin`, `webauthn.get`, `UP` + `UV` flags, and mandatory
+  nonce-bound challenge (`sha256(nonce:order_hash)`).
+- Fail-closed live mode: when `allow_live=True` or account is non-`DU*`, WebAuthn
+  co-signature defaults to `True` and refuses execution without a pinned passkey
+  (`LIVE_PASSKEY_PIN_REQUIRED`).
+- Per-poll mark-to-market drawdown monitor that automatically latches `killswitch.json`
+  with `reason="DAILY_DRAWDOWN_BREACHED"` when `daily_loss_pct >= max_daily_loss_pct`.
+- Split-key Ed25519 policy ticket verification (`authority_public_key_pem`, verify-only).
+- Honest fill receipts: never fabricates `fill_price = fresh_price` on `"submitted"`.
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import socket
@@ -22,17 +23,21 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
 from typing import Any, Callable, Optional, TextIO
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
-
-from clearfills_firewall import OrderType, Side, TradeProposal
+from clearfills_firewall import KillSwitch, OrderType, Side, SignedAttestation, TradeProposal
 
 from .ibkr import IBKRExecutionAdapter, LiveExecutionSafetyError, mask_account_id
 from .telemetry import sanitize_text
+from .webauthn_verifier import (
+    DEFAULT_WEBAUTHN_ORIGIN,
+    DEFAULT_WEBAUTHN_RP_ID,
+    canonical_order_digest,
+    compute_approval_hash,
+    extract_client_challenge,
+    extract_webauthn_assertion,
+    verify_webauthn_assertion,
+)
 
 DEFAULT_CLOUD_API_URL = "https://clearfills-api.fly.dev"
 _IBKR_VENUE = "ibkr"
@@ -91,624 +96,76 @@ def _nested_order_fields(record: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _b64u_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _decode_b64_flexible(data: str) -> bytes:
-    """Decode standard base64 or base64url (padded or unpadded) strictly."""
-    cleaned = "".join(data.split()).rstrip("=")
-    if not cleaned or len(cleaned) % 4 == 1:
-        raise ValueError("Invalid base64 encoding.")
-    normalized = cleaned.replace("+", "-").replace("/", "_")
-    pad = "=" * ((4 - len(normalized) % 4) % 4)
-    return base64.urlsafe_b64decode((normalized + pad).encode("ascii"))
-
-
-def _has_canonical_approval_record_fields(record: dict[str, Any]) -> bool:
-    return (
-        record.get("created_at") is not None
-        and record.get("sleeve") is not None
-        and record.get("notional_usd") is not None
-    )
-
-
-def compute_approval_hash(record: dict[str, Any]) -> str:
-    """Compute canonical SHA-256 approval_hash matching ClearFills Cloud `ApprovalRecord`."""
-    nested = _nested_order_fields(record)
-    approval_id = str(record.get("approval_id") or record.get("id") or "").strip()
-    symbol = str(record.get("symbol") or nested.get("symbol") or "").strip().upper()
-    side = str(record.get("side") or nested.get("side") or "").strip().upper()
-    qty_raw = record.get("quantity") if record.get("quantity") is not None else nested.get("quantity")
-    quantity = float(qty_raw) if qty_raw is not None else 0.0
-    lmt_raw = record.get("limit_price") if record.get("limit_price") is not None else nested.get("limit_price")
-    limit_price = float(lmt_raw) if lmt_raw is not None else None
-    stp_raw = record.get("stop_price") if record.get("stop_price") is not None else nested.get("stop_price")
-    stop_price = round(float(stp_raw), 6) if stp_raw is not None else None
-    tgt_raw = record.get("target_price") if record.get("target_price") is not None else nested.get("target_price")
-    target_price = round(float(tgt_raw), 6) if tgt_raw is not None else None
-    order_type = str(record.get("order_type") or nested.get("order_type") or "LIMIT").strip().upper()
-    venue = str(record.get("venue") or nested.get("venue") or _IBKR_VENUE).strip().lower()
-    agent_id = str(record.get("agent_id") or nested.get("agent_id") or "agent").strip()
-
-    if _has_canonical_approval_record_fields(record):
-        raw_dt = record["created_at"]
-        created_iso = (
-            raw_dt.isoformat()
-            if isinstance(raw_dt, datetime)
-            else datetime.fromisoformat(str(raw_dt)).isoformat()
-        )
-        canonical_obj: dict[str, Any] = {
-            "approval_id": approval_id,
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "limit_price": limit_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "order_type": order_type,
-            "notional_usd": float(record["notional_usd"]),
-            "sleeve": str(record["sleeve"]).strip(),
-            "venue": venue,
-            "attestation_id": record.get("attestation_id"),
-            "agent_id": agent_id,
-            "created_at": created_iso,
-        }
-    else:
-        canonical_obj = {
-            "approval_id": approval_id,
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "limit_price": limit_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "order_type": order_type,
-            "venue": venue,
-            "agent_id": agent_id,
-        }
-
-    encoded = json.dumps(canonical_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _bundle_order_fields_match_record(record: dict[str, Any], bundle: dict[str, Any]) -> bool:
-    """Verify any explicit order fields embedded inside `bundle` match `record`."""
-    rec_nested = _nested_order_fields(record)
-    bun_nested = bundle.get("order_summary") if isinstance(bundle.get("order_summary"), dict) else {}
-
-    rec_id = str(record.get("approval_id") or record.get("id") or "").strip()
-    bun_id = str(bundle.get("approval_id") or "").strip()
-    if rec_id and bun_id and rec_id != bun_id:
-        return False
-
-    for str_key in ("symbol", "side"):
-        bun_val = bundle.get(str_key) if bundle.get(str_key) is not None else bun_nested.get(str_key)
-        if bun_val is not None:
-            rec_val = record.get(str_key) if record.get(str_key) is not None else rec_nested.get(str_key)
-            if str(bun_val).strip().upper() != str(rec_val or "").strip().upper():
-                return False
-
-    for num_key in ("quantity", "limit_price"):
-        bun_num = _opt_float(
-            bundle.get(num_key) if bundle.get(num_key) is not None else bun_nested.get(num_key)
-        )
-        if bun_num is not None:
-            rec_num = _opt_float(
-                record.get(num_key) if record.get(num_key) is not None else rec_nested.get(num_key)
-            )
-            if rec_num is None or abs(bun_num - rec_num) > 1e-6:
-                return False
-
-    return True
+# ---------------------------------------------------------------------------
+# Backwards-compatible aliases delegating to the single canonical verifier
+# ---------------------------------------------------------------------------
 
 
 def verify_operator_passkey_cosignature(
     record: dict[str, Any],
     trusted_spki_keys_b64: list[str],
+    *,
+    expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
+    expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
+    trusted_credential_ids: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
-    """Independently verify a WebAuthn Touch ID / YubiKey co-signature on the local desk.
-
-    Fails closed when `trusted_spki_keys_b64` is non-empty and the assertion bundle is
-    missing, malformed, missing the User Present flag, mismatched against
-    `base64url(sha256(f"{challenge_nonce}:{approval_hash}"))`, tampered relative to the
-    canonical order fields, or not signed by a pinned ECDSA P-256 / RSA public key.
-    """
-    pinned_keys = [k.strip() for k in trusted_spki_keys_b64 if isinstance(k, str) and k.strip()]
-    if not pinned_keys:
-        return True, "no_pinned_passkey_configured"
-
-    if not isinstance(record, dict):
-        return False, "Approval record must be a dictionary."
-
-    raw_bundle = (
-        record.get("passkey_assertion_bundle")
-        or record.get("passkey_assertion")
-        or record.get("webauthn_proof")
-        or record.get("passkey_proof")
+    """Delegate to the single canonical fail-closed WebAuthn verifier."""
+    return verify_webauthn_assertion(
+        record,
+        trusted_spki_keys_b64,
+        expected_rp_id=expected_rp_id,
+        expected_origin=expected_origin,
+        trusted_credential_ids=trusted_credential_ids,
     )
-    if not isinstance(raw_bundle, dict) or not raw_bundle:
-        return False, "Missing passkey_assertion_bundle on approval record."
-    bundle = raw_bundle
-
-    parsed_keys: list[ec.EllipticCurvePublicKey | rsa.RSAPublicKey] = []
-    for raw_key in pinned_keys:
-        try:
-            if raw_key.startswith("-----BEGIN"):
-                pub = serialization.load_pem_public_key(raw_key.encode("utf-8"))
-            else:
-                pub = serialization.load_der_public_key(_decode_b64_flexible(raw_key))
-            if isinstance(pub, ec.EllipticCurvePublicKey) and isinstance(pub.curve, ec.SECP256R1):
-                parsed_keys.append(pub)
-            elif isinstance(pub, rsa.RSAPublicKey):
-                parsed_keys.append(pub)
-        except Exception:
-            continue
-
-    if not parsed_keys:
-        return False, "No valid DER SPKI ECDSA P-256 or RSA public keys in operator_passkey_spki_b64."
-
-    raw_auth_data = bundle.get("authenticator_data")
-    raw_client_data = bundle.get("client_data_json")
-    raw_signature = bundle.get("signature")
-    raw_challenge = bundle.get("challenge")
-    if (
-        not isinstance(raw_auth_data, str)
-        or not raw_auth_data.strip()
-        or not isinstance(raw_client_data, str)
-        or not raw_client_data.strip()
-        or not isinstance(raw_signature, str)
-        or not raw_signature.strip()
-        or not isinstance(raw_challenge, str)
-        or not raw_challenge.strip()
-    ):
-        return (
-            False,
-            "Missing required WebAuthn fields (authenticator_data, client_data_json, signature, challenge).",
-        )
-
-    challenge = raw_challenge.strip()
-    try:
-        auth_data = _decode_b64_flexible(raw_auth_data)
-        client_data_bytes = _decode_b64_flexible(raw_client_data)
-        sig_bytes = _decode_b64_flexible(raw_signature)
-    except Exception as exc:
-        return False, f"Malformed base64 WebAuthn assertion payload: {exc}"
-
-    if len(auth_data) < 37:
-        return False, "Invalid WebAuthn authenticatorData (must be at least 37 bytes)."
-    if (auth_data[32] & 0x01) == 0:
-        return False, "WebAuthn User Present (UP) bit is not set."
-
-    try:
-        client_data = json.loads(client_data_bytes.decode("utf-8"))
-    except Exception:
-        return False, "Invalid JSON in WebAuthn clientDataJSON."
-    if not isinstance(client_data, dict):
-        return False, "WebAuthn clientDataJSON must be an object."
-    if client_data.get("type") != "webauthn.get":
-        return False, f"Invalid WebAuthn clientDataJSON.type {client_data.get('type')!r} (expected 'webauthn.get')."
-    if str(client_data.get("challenge") or "").strip() != challenge:
-        return False, "WebAuthn clientDataJSON.challenge does not match assertion challenge."
-
-    record_hash = str(record.get("approval_hash") or "").strip()
-    bundle_hash = str(bundle.get("approval_hash") or "").strip()
-    if record_hash and bundle_hash and record_hash != bundle_hash:
-        return False, "approval_hash mismatch between approval record and passkey_assertion_bundle."
-    approval_hash = record_hash or bundle_hash
-
-    if approval_hash and _has_canonical_approval_record_fields(record):
-        try:
-            recomputed_hash = compute_approval_hash(record)
-        except Exception as exc:
-            return False, f"Failed computing canonical approval_hash from order fields: {exc}"
-        if recomputed_hash != approval_hash:
-            return (
-                False,
-                "Order parameters in approval record do not match approval_hash (tampered order rejected).",
-            )
-
-    if not _bundle_order_fields_match_record(record, bundle):
-        return False, "Order parameters in approval record do not match passkey_assertion_bundle."
-
-    challenge_nonce = str(bundle.get("challenge_nonce") or record.get("challenge_nonce") or "").strip()
-    if bundle.get("challenge_binding") == "sha256(nonce:approval_hash)" and (
-        not challenge_nonce or not approval_hash
-    ):
-        return (
-            False,
-            "Assertion declares sha256(nonce:approval_hash) binding without challenge_nonce and approval_hash.",
-        )
-    if challenge_nonce and approval_hash:
-        expected_challenge = _b64u_encode(
-            hashlib.sha256(f"{challenge_nonce}:{approval_hash}".encode("utf-8")).digest()
-        )
-        if challenge != expected_challenge:
-            return (
-                False,
-                "WebAuthn challenge mismatch: expected base64url(sha256(challenge_nonce:approval_hash)).",
-            )
-
-    signed_payload = auth_data + hashlib.sha256(client_data_bytes).digest()
-    for pub_key in parsed_keys:
-        try:
-            if isinstance(pub_key, ec.EllipticCurvePublicKey):
-                pub_key.verify(sig_bytes, signed_payload, ec.ECDSA(hashes.SHA256()))
-                return True, "ok"
-            if isinstance(pub_key, rsa.RSAPublicKey):
-                pub_key.verify(sig_bytes, signed_payload, padding.PKCS1v15(), hashes.SHA256())
-                return True, "ok"
-        except InvalidSignature:
-            continue
-        except Exception:
-            continue
-
-    return False, "WebAuthn signature did not match any pinned key in operator_passkey_spki_b64."
-
-
-def _b64u_decode(data: str) -> bytes:
-    cleaned = data.strip()
-    pad = "=" * ((4 - len(cleaned) % 4) % 4)
-    return base64.urlsafe_b64decode(cleaned + pad)
-
-
-def _derive_order_bound_challenge(nonce_b64: str, approval_hash: str) -> str:
-    digest = hashlib.sha256(f"{nonce_b64}:{approval_hash}".encode("utf-8")).digest()
-    return _b64u_encode(digest)
 
 
 def verify_local_webauthn_cosign(
     record: dict[str, Any],
     trusted_spki_b64: list[str],
+    *,
+    expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
+    expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
+    trusted_credential_ids: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
-    """Independently verify a hardware WebAuthn ECDSA P-256 / RSA co-signature against locally pinned SPKI keys."""
-    pinned_keys = [k.strip() for k in (trusted_spki_b64 or []) if isinstance(k, str) and k.strip()]
-    if not pinned_keys:
-        return False, "No locally pinned trusted passkey SPKI public keys configured."
-
-    proof = record.get("webauthn_proof")
-    if not isinstance(proof, dict):
-        proof = record.get("passkey_proof")
-    if not isinstance(proof, dict):
-        return False, "Missing webauthn_proof on approval record."
-
-    for field in ("authenticator_data", "client_data_json", "signature"):
-        val = proof.get(field)
-        if not isinstance(val, str) or not val.strip():
-            return False, f"Missing or empty webauthn_proof.{field}."
-
-    try:
-        auth_data = _b64u_decode(proof["authenticator_data"])
-        client_data_bytes = _b64u_decode(proof["client_data_json"])
-        sig_bytes = _b64u_decode(proof["signature"])
-    except Exception:
-        return False, "Malformed base64url payload in webauthn_proof."
-
-    if len(auth_data) < 37:
-        return False, "Invalid WebAuthn authenticatorData (too short)."
-    if (auth_data[32] & 0x01) == 0:
-        return False, "WebAuthn User Present (UP) flag is not set."
-
-    try:
-        client_data = json.loads(client_data_bytes.decode("utf-8"))
-    except Exception:
-        return False, "Invalid WebAuthn clientDataJSON."
-    if not isinstance(client_data, dict):
-        return False, "Invalid WebAuthn clientDataJSON."
-    if client_data.get("type") != "webauthn.get":
-        return False, "Invalid WebAuthn ceremony type (expected webauthn.get)."
-
-    client_challenge = str(client_data.get("challenge", "")).strip()
-    if not client_challenge:
-        return False, "Missing challenge in WebAuthn clientDataJSON."
-
-    proof_challenge = proof.get("challenge")
-    if isinstance(proof_challenge, str) and proof_challenge.strip() and proof_challenge.strip() != client_challenge:
-        return False, "WebAuthn proof challenge does not match clientDataJSON.challenge."
-
-    raw_nonce = proof.get("challenge_nonce") or record.get("challenge_nonce")
-    challenge_nonce = raw_nonce.strip() if isinstance(raw_nonce, str) and raw_nonce.strip() else None
-
-    raw_record_hash = record.get("approval_hash")
-    record_approval_hash = (
-        raw_record_hash.strip() if isinstance(raw_record_hash, str) and raw_record_hash.strip() else None
+    """Delegate to the single canonical fail-closed WebAuthn verifier."""
+    return verify_webauthn_assertion(
+        record,
+        trusted_spki_b64,
+        expected_rp_id=expected_rp_id,
+        expected_origin=expected_origin,
+        trusted_credential_ids=trusted_credential_ids,
     )
-    raw_proof_hash = proof.get("approval_hash")
-    proof_approval_hash = (
-        raw_proof_hash.strip() if isinstance(raw_proof_hash, str) and raw_proof_hash.strip() else None
-    )
-
-    if record_approval_hash is not None and proof_approval_hash is not None and record_approval_hash != proof_approval_hash:
-        return False, "WebAuthn proof approval_hash does not match approval record approval_hash."
-
-    effective_approval_hash = record_approval_hash or proof_approval_hash
-    if challenge_nonce is not None and effective_approval_hash is not None:
-        expected_challenge = _derive_order_bound_challenge(challenge_nonce, effective_approval_hash)
-        if client_challenge != expected_challenge:
-            return False, "WebAuthn challenge mismatch: does not match sha256(nonce:approval_hash)."
-    elif proof.get("challenge_binding") == "sha256(nonce:approval_hash)":
-        return False, "Missing challenge_nonce or approval_hash for order-bound WebAuthn challenge."
-
-    signed_payload = auth_data + hashlib.sha256(client_data_bytes).digest()
-    for spki_b64 in pinned_keys:
-        try:
-            pub_key = serialization.load_der_public_key(_b64u_decode(spki_b64))
-        except Exception:
-            continue
-        try:
-            if isinstance(pub_key, ec.EllipticCurvePublicKey):
-                pub_key.verify(sig_bytes, signed_payload, ec.ECDSA(hashes.SHA256()))
-                return True, "WebAuthn ECDSA co-signature verified against locally pinned key."
-            if isinstance(pub_key, rsa.RSAPublicKey):
-                pub_key.verify(sig_bytes, signed_payload, padding.PKCS1v15(), hashes.SHA256())
-                return True, "WebAuthn RSA co-signature verified against locally pinned key."
-        except InvalidSignature:
-            continue
-        except Exception:
-            continue
-
-    return False, "WebAuthn cryptographic signature failed against all locally pinned trusted keys."
-
-
-def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def canonical_order_digest(approval: dict[str, Any]) -> str:
-    """Compute RFC 8785 JCS-style canonical SHA-256 hex digest over core order legs.
-
-    Binds `(symbol, side, quantity, limit_price, stop_price, venue)` so any mutation
-    to order parameters invalidates the WebAuthn challenge binding.
-    """
-    nested = _nested_order_fields(approval)
-    symbol = str(approval.get("symbol") or nested.get("symbol") or "").strip().upper()
-    side = str(approval.get("side") or nested.get("side") or "").strip().upper()
-    qty_val = _opt_float(
-        approval.get("quantity") if approval.get("quantity") is not None else nested.get("quantity")
-    )
-    lmt_val = _opt_float(
-        approval.get("limit_price")
-        if approval.get("limit_price") is not None
-        else nested.get("limit_price")
-    )
-    stp_val = _opt_float(
-        approval.get("stop_price")
-        if approval.get("stop_price") is not None
-        else nested.get("stop_price")
-    )
-    venue = str(approval.get("venue") or nested.get("venue") or _IBKR_VENUE).strip().lower()
-
-    canonical_obj: dict[str, Any] = {
-        "limit_price": round(lmt_val, 8) if lmt_val is not None else None,
-        "quantity": round(qty_val, 8) if qty_val is not None else None,
-        "side": side,
-        "stop_price": round(stp_val, 8) if stp_val is not None else None,
-        "symbol": symbol,
-        "venue": venue,
-    }
-    encoded = json.dumps(
-        canonical_obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _extract_webauthn_assertion(approval: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Return the first non-empty WebAuthn assertion dictionary present on `approval`."""
-    if not isinstance(approval, dict):
-        return None
-    for key in (
-        "webauthn_assertion",
-        "passkey_assertion",
-        "passkey_assertion_bundle",
-        "webauthn_proof",
-        "passkey_proof",
-    ):
-        candidate = approval.get(key)
-        if isinstance(candidate, dict) and candidate:
-            return candidate
-    return None
-
-
-def _load_p256_spki_key(raw_key: str) -> tuple[ec.EllipticCurvePublicKey, bytes]:
-    """Load an ECDSA P-256 (SECP256R1) SPKI public key from base64/base64url DER or PEM."""
-    cleaned = raw_key.strip()
-    if not cleaned:
-        raise ValueError("Empty public key.")
-    if cleaned.startswith("-----BEGIN"):
-        pub = serialization.load_pem_public_key(cleaned.encode("utf-8"))
-    else:
-        pub = serialization.load_der_public_key(_decode_b64_flexible(cleaned))
-    if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
-        raise ValueError("Public key must be an ECDSA P-256 (SECP256R1) key.")
-    canonical_der = pub.public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return pub, canonical_der
-
-
-def _extract_client_challenge(assertion: dict[str, Any]) -> Optional[str]:
-    """Extract the challenge string from `clientDataJSON` (or fallback `challenge` field)."""
-    raw_client_data = assertion.get("clientDataJSON") or assertion.get("client_data_json")
-    if isinstance(raw_client_data, str) and raw_client_data.strip():
-        try:
-            client_data = json.loads(_decode_b64_flexible(raw_client_data).decode("utf-8"))
-            if isinstance(client_data, dict):
-                ch = str(client_data.get("challenge") or "").strip()
-                if ch:
-                    return ch
-        except Exception:
-            pass
-    raw_ch = assertion.get("challenge")
-    if isinstance(raw_ch, str) and raw_ch.strip():
-        return raw_ch.strip()
-    return None
 
 
 def verify_webauthn_cosignature(
     approval: dict[str, Any],
     registered_pubkeys_b64: list[str] | None = None,
     *,
-    require_uv: bool = False,
+    require_uv: bool = True,
+    expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
+    expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
+    trusted_credential_ids: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
-    """Verify a hardware WebAuthn ECDSA P-256 co-signature bound to canonical order legs.
+    """Delegate to the single canonical fail-closed WebAuthn verifier.
 
-    Recomputes the RFC 8785 JCS-style SHA-256 digest of
-    `(symbol, side, quantity, limit_price, stop_price, venue)`, validates
-    `clientDataJSON` (`type == "webauthn.get"` and order-digest challenge binding),
-    checks `authenticatorData` flags (`UP` bit 0x01, plus `UV` bit 0x04 when
-    `require_uv=True`), verifies the P-256 DER ECDSA-SHA256 signature over
-    `authenticatorData || sha256(clientDataJSON)`, and enforces the locally pinned
-    `registered_pubkeys_b64` allowlist when configured.
+    Note: `UV` (User Verified) and locally pinned keys are ALWAYS strictly required.
     """
-    if not isinstance(approval, dict):
-        return False, "Approval payload must be a dictionary."
-
-    assertion = _extract_webauthn_assertion(approval)
-    if assertion is None:
-        return False, "Missing WebAuthn passkey assertion on approval."
-
-    raw_auth_data = assertion.get("authenticatorData") or assertion.get("authenticator_data")
-    raw_client_data = assertion.get("clientDataJSON") or assertion.get("client_data_json")
-    raw_signature = assertion.get("signature")
-    raw_pubkey = (
-        assertion.get("public_key_spki_b64")
-        or assertion.get("publicKeySpkiB64")
-        or assertion.get("public_key")
+    _ = require_uv  # UV is unconditionally enforced by verify_webauthn_assertion.
+    return verify_webauthn_assertion(
+        approval,
+        list(registered_pubkeys_b64 or []),
+        expected_rp_id=expected_rp_id,
+        expected_origin=expected_origin,
+        trusted_credential_ids=trusted_credential_ids,
     )
-
-    if (
-        not isinstance(raw_auth_data, str)
-        or not raw_auth_data.strip()
-        or not isinstance(raw_client_data, str)
-        or not raw_client_data.strip()
-        or not isinstance(raw_signature, str)
-        or not raw_signature.strip()
-    ):
-        return (
-            False,
-            "Missing required WebAuthn assertion fields (authenticatorData, clientDataJSON, signature).",
-        )
-
-    try:
-        auth_data = _decode_b64_flexible(raw_auth_data)
-        client_data_bytes = _decode_b64_flexible(raw_client_data)
-        sig_bytes = _decode_b64_flexible(raw_signature)
-    except Exception as exc:
-        return False, f"Malformed base64 WebAuthn assertion payload: {exc}"
-
-    if len(auth_data) < 37:
-        return False, "Invalid WebAuthn authenticatorData (must be at least 37 bytes)."
-
-    flags = auth_data[32]
-    if (flags & 0x01) == 0:
-        return False, "WebAuthn User Present (UP) flag is not set."
-    if require_uv and (flags & 0x04) == 0:
-        return False, "WebAuthn User Verified (UV) flag is required but not set."
-
-    try:
-        client_data = json.loads(client_data_bytes.decode("utf-8"))
-    except Exception:
-        return False, "Invalid JSON in WebAuthn clientDataJSON."
-    if not isinstance(client_data, dict):
-        return False, "WebAuthn clientDataJSON must be a JSON object."
-    if client_data.get("type") != "webauthn.get":
-        return (
-            False,
-            f"Invalid WebAuthn clientDataJSON.type {client_data.get('type')!r} (expected 'webauthn.get').",
-        )
-
-    client_challenge = str(client_data.get("challenge") or "").strip()
-    if not client_challenge:
-        return False, "Missing challenge in WebAuthn clientDataJSON."
-
-    explicit_challenge = assertion.get("challenge")
-    if (
-        isinstance(explicit_challenge, str)
-        and explicit_challenge.strip()
-        and explicit_challenge.strip() != client_challenge
-    ):
-        return False, "WebAuthn assertion challenge does not match clientDataJSON.challenge."
-
-    # Recompute canonical order digest and verify challenge binding.
-    order_digest = canonical_order_digest(approval)
-    valid_challenges: set[str] = {
-        order_digest,
-        _b64u_encode(bytes.fromhex(order_digest)),
-        _b64u_encode(order_digest.encode("utf-8")),
-    }
-    raw_nonce = assertion.get("challenge_nonce") or approval.get("challenge_nonce")
-    challenge_nonce = raw_nonce.strip() if isinstance(raw_nonce, str) and raw_nonce.strip() else None
-    if challenge_nonce is not None:
-        valid_challenges.add(
-            _b64u_encode(hashlib.sha256(f"{challenge_nonce}:{order_digest}".encode("utf-8")).digest())
-        )
-        if _has_canonical_approval_record_fields(approval):
-            recomputed_approval_hash = compute_approval_hash(approval)
-            valid_challenges.add(
-                _b64u_encode(
-                    hashlib.sha256(
-                        f"{challenge_nonce}:{recomputed_approval_hash}".encode("utf-8")
-                    ).digest()
-                )
-            )
-
-    if client_challenge not in valid_challenges:
-        return (
-            False,
-            "WebAuthn challenge does not match canonical order digest binding (order parameters may have been tampered).",
-        )
-
-    # Parse locally pinned P-256 allowlist if configured.
-    pinned_keys_raw = [
-        k.strip() for k in (registered_pubkeys_b64 or []) if isinstance(k, str) and k.strip()
-    ]
-    pinned_by_der: dict[bytes, ec.EllipticCurvePublicKey] = {}
-    if pinned_keys_raw:
-        for raw_pinned in pinned_keys_raw:
-            try:
-                pub, der = _load_p256_spki_key(raw_pinned)
-                pinned_by_der[der] = pub
-            except Exception:
-                continue
-        if not pinned_by_der:
-            return False, "No valid ECDSA P-256 SPKI keys in registered_pubkeys_b64."
-
-    candidate_keys: list[ec.EllipticCurvePublicKey] = []
-    if isinstance(raw_pubkey, str) and raw_pubkey.strip():
-        try:
-            pub_key, pub_der = _load_p256_spki_key(raw_pubkey)
-        except Exception as exc:
-            return False, f"Invalid WebAuthn public_key_spki_b64: {exc}"
-        if pinned_by_der and pub_der not in pinned_by_der:
-            return False, "WebAuthn public key is not in the locally pinned allowlist."
-        candidate_keys = [pub_key]
-    elif pinned_by_der:
-        candidate_keys = list(pinned_by_der.values())
-    else:
-        return (
-            False,
-            "Missing public_key_spki_b64 in WebAuthn assertion and no registered_pubkeys_b64 configured.",
-        )
-
-    signed_payload = auth_data + hashlib.sha256(client_data_bytes).digest()
-    for pub_key in candidate_keys:
-        try:
-            pub_key.verify(sig_bytes, signed_payload, ec.ECDSA(hashes.SHA256()))
-            return True, "ok"
-        except InvalidSignature:
-            continue
-        except Exception:
-            continue
-
-    return False, "Invalid WebAuthn ECDSA P-256 signature."
 
 
 class ApprovalWorker:
-    """Polls ClearFills Cloud for approved IBKR orders and executes them with fresh attestations."""
+    """Polls ClearFills Cloud for approved IBKR orders and executes them with strict fail-closed guards."""
 
     def __init__(
         self,
@@ -723,9 +180,13 @@ class ApprovalWorker:
         heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC,
         max_favorable_gap_bps: float = 1000.0,
         trusted_passkey_spki_b64: Optional[list[str]] = None,
-        require_webauthn_cosign: bool = False,
+        trusted_credential_ids: Optional[list[str]] = None,
+        webauthn_rp_id: Optional[str] = None,
+        webauthn_origin: Optional[str] = None,
+        require_webauthn_cosign: Optional[bool] = None,
         require_passkey_cosign: Optional[bool] = None,
-        require_passkey_uv: bool = False,
+        require_passkey_uv: bool = True,
+        authority_public_key_pem: Optional[str] = None,
     ) -> None:
         self.adapter = adapter
         self.api_key = api_key.strip()
@@ -742,19 +203,62 @@ class ApprovalWorker:
         self._heartbeat_interval_sec = float(heartbeat_interval_sec)
         self._last_heartbeat_at: Optional[float] = None
         self._used_passkey_challenges: set[str] = set()
+
         self._trusted_passkey_spki_b64: list[str] = [
             k.strip() for k in (trusted_passkey_spki_b64 or []) if isinstance(k, str) and k.strip()
         ]
-        self.require_webauthn_cosign: bool = bool(require_webauthn_cosign)
-        if require_passkey_cosign is not None:
-            self.require_passkey_cosign = bool(require_passkey_cosign)
-        else:
-            self.require_passkey_cosign = _env_flag("CLEARFILLS_REQUIRE_PASSKEY_COSIGN") or bool(
-                getattr(desk_cfg, "require_passkey_cosign", False)
+        cfg_cred_ids = list(getattr(desk_cfg, "trusted_credential_ids", []) or [])
+        self._trusted_credential_ids: list[str] = list(
+            dict.fromkeys(
+                c.strip()
+                for c in [*cfg_cred_ids, *(trusted_credential_ids or [])]
+                if isinstance(c, str) and c.strip()
             )
-        self.require_passkey_uv: bool = bool(require_passkey_uv) or _env_flag(
-            "CLEARFILLS_REQUIRE_PASSKEY_UV"
         )
+        self._webauthn_rp_id: str = (
+            (webauthn_rp_id or getattr(desk_cfg, "webauthn_rp_id", None) or DEFAULT_WEBAUTHN_RP_ID).strip()
+        )
+        self._webauthn_origin: str = (
+            (webauthn_origin or getattr(desk_cfg, "webauthn_origin", None) or DEFAULT_WEBAUTHN_ORIGIN).strip()
+        )
+
+        # Fail-closed live mode detection: allow_live=True or non-DU account defaults cosign to True.
+        ibkr_cfg = getattr(desk_cfg, "ibkr", None)
+        account_id = str(getattr(ibkr_cfg, "account_id", "") or "").strip()
+        allow_live = bool(getattr(ibkr_cfg, "allow_live", False))
+        exec_mode = str(getattr(adapter, "execution_mode", getattr(adapter, "_mode", "paper")) or "paper").lower()
+        self._is_live_mode: bool = (
+            exec_mode == "live"
+            or allow_live
+            or (bool(account_id) and not account_id.startswith("DU"))
+        )
+
+        if require_webauthn_cosign is not None:
+            self.require_webauthn_cosign: bool = bool(require_webauthn_cosign)
+        else:
+            self.require_webauthn_cosign = self._is_live_mode
+
+        if require_passkey_cosign is not None:
+            self.require_passkey_cosign: bool = bool(require_passkey_cosign)
+        else:
+            self.require_passkey_cosign = (
+                self._is_live_mode
+                or _env_flag("CLEARFILLS_REQUIRE_PASSKEY_COSIGN")
+                or bool(getattr(desk_cfg, "require_passkey_cosign", False))
+            )
+
+        # UV is unconditionally enforced by verify_webauthn_assertion.
+        self.require_passkey_uv: bool = True if require_passkey_uv else True
+
+        # Split-key verify-only Ed25519 authority public key (no private key in worker).
+        resolved_authority_pem = (
+            authority_public_key_pem
+            or getattr(desk_cfg, "authority_public_key_pem", None)
+            or os.getenv("CLEARFILLS_AUTHORITY_PUBLIC_KEY_PEM")
+            or ""
+        ).strip()
+        if resolved_authority_pem:
+            self.adapter.runtime.set_authority_public_key(resolved_authority_pem)
 
     def _cloud_request(
         self,
@@ -799,6 +303,43 @@ class ApprovalWorker:
         last = _opt_float(quote.get("last"))
         if last is not None and last > 0:
             return last
+        return None
+
+    def _get_latchable_kill_switch(self) -> KillSwitch:
+        fw_ks = getattr(self.adapter.runtime.firewall, "kill_switch", None)
+        if isinstance(fw_ks, KillSwitch):
+            return fw_ks
+        return KillSwitch(self.adapter.runtime.state_dir / "firewall" / "killswitch.json")
+
+    def _is_kill_switch_tripped(self) -> bool:
+        fw_ks = getattr(self.adapter.runtime.firewall, "kill_switch", None)
+        if fw_ks is not None:
+            try:
+                if fw_ks.status().tripped:
+                    return True
+            except Exception:
+                return True
+        local_ks_path = self.adapter.runtime.state_dir / "firewall" / "killswitch.json"
+        if local_ks_path.exists():
+            if KillSwitch(local_ks_path).is_tripped():
+                return True
+        return False
+
+    def check_drawdown_and_latch_killswitch(self) -> Optional[dict[str, Any]]:
+        """Monitor live mark-to-market drawdown on every poll cycle and auto-latch killswitch.json."""
+        portfolio = self.adapter.build_portfolio_snapshot()
+        max_daily_loss_pct = float(self.adapter.runtime.config.risk.max_daily_loss_pct)
+        if portfolio.daily_loss_pct >= max_daily_loss_pct:
+            ks = self._get_latchable_kill_switch()
+            if not ks.is_tripped():
+                ks.trip(reason="DAILY_DRAWDOWN_BREACHED", actor=self.worker_id)
+            return {
+                "tripped": True,
+                "reason": "DAILY_DRAWDOWN_BREACHED",
+                "daily_pnl_usd": portfolio.daily_pnl_usd,
+                "daily_loss_pct": round(portfolio.daily_loss_pct, 4),
+                "max_daily_loss_pct": max_daily_loss_pct,
+            }
         return None
 
     def _process_approval(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -867,79 +408,63 @@ class ApprovalWorker:
                 "detail": detail,
             }
 
-        # 3a-ii. Dual-Key Hardware WebAuthn P-256 co-signature verification (fail closed before IBKR).
+        # 3a-ii. Single canonical WebAuthn co-signature verification (fail-closed before IBKR).
         trusted_keys = list(getattr(self.adapter.runtime.config, "operator_passkey_spki_b64", []) or [])
         combined_pinned_keys: list[str] = list(dict.fromkeys([*trusted_keys, *self._trusted_passkey_spki_b64]))
         used_cosign_challenge: Optional[str] = None
-        assertion = _extract_webauthn_assertion(record)
+        assertion = extract_webauthn_assertion(record)
 
-        if self.require_passkey_cosign or (
-            assertion is not None
-            and not trusted_keys
-            and not self.require_webauthn_cosign
-            and not self._trusted_passkey_spki_b64
-        ):
-            cosign_ok, cosign_detail = verify_webauthn_cosignature(
-                record,
-                registered_pubkeys_b64=combined_pinned_keys or None,
-                require_uv=self.require_passkey_uv,
-            )
-            if cosign_ok and assertion is not None:
-                ch = _extract_client_challenge(assertion)
-                if ch and ch in self._used_passkey_challenges:
-                    cosign_ok = False
-                    cosign_detail = "Replayed WebAuthn passkey challenge rejected by local worker."
-                elif ch:
-                    used_cosign_challenge = ch
-            if not cosign_ok:
+        cosign_required = (
+            self._is_live_mode
+            or self.require_webauthn_cosign
+            or self.require_passkey_cosign
+            or bool(combined_pinned_keys)
+            or assertion is not None
+        )
+        if cosign_required:
+            if self._is_live_mode and not combined_pinned_keys:
+                detail = (
+                    "LIVE_PASSKEY_PIN_REQUIRED: Live execution requires at least one locally pinned "
+                    "WebAuthn passkey SPKI public key (operator_passkey_spki_b64 / trusted_passkey_spki_b64)."
+                )
                 self._report_execution(
                     approval_id,
-                    {"status": "cosign_rejected", "detail": cosign_detail},
+                    {"status": "cosign_rejected", "detail": detail},
                 )
                 return {
                     "approval_id": approval_id,
                     "symbol": symbol,
                     "status": "cosign_rejected",
-                    "detail": cosign_detail,
+                    "detail": detail,
                 }
-        else:
-            if trusted_keys:
-                cosign_ok, cosign_reason = verify_operator_passkey_cosignature(record, trusted_keys)
-                if cosign_ok and assertion is not None:
-                    ch = str(assertion.get("challenge") or "").strip() or _extract_client_challenge(assertion)
-                    if ch and ch in self._used_passkey_challenges:
-                        cosign_ok = False
-                        cosign_reason = "Replayed WebAuthn passkey challenge rejected by local worker."
-                    elif ch:
-                        used_cosign_challenge = ch
-                if not cosign_ok:
-                    detail = f"Operator hardware passkey co-signature verification failed: {cosign_reason}"
-                    self._report_execution(
-                        approval_id,
-                        {"status": "execution_failed", "detail": detail},
-                    )
-                    return {
-                        "approval_id": approval_id,
-                        "symbol": symbol,
-                        "status": "execution_failed",
-                        "detail": detail,
-                    }
 
-            if self.require_webauthn_cosign or self._trusted_passkey_spki_b64:
-                cosign_ok, cosign_detail = verify_local_webauthn_cosign(
-                    record, self._trusted_passkey_spki_b64
+            cosign_ok, cosign_detail = verify_webauthn_assertion(
+                record,
+                combined_pinned_keys,
+                expected_rp_id=self._webauthn_rp_id,
+                expected_origin=self._webauthn_origin,
+                trusted_credential_ids=self._trusted_credential_ids or None,
+            )
+            if cosign_ok and assertion is not None:
+                ch = extract_client_challenge(assertion)
+                if ch and ch in self._used_passkey_challenges:
+                    cosign_ok = False
+                    cosign_detail = "Replayed WebAuthn passkey challenge rejected by local worker."
+                elif ch:
+                    used_cosign_challenge = ch
+
+            if not cosign_ok:
+                detail = f"Operator hardware passkey co-signature verification failed: {cosign_detail}"
+                self._report_execution(
+                    approval_id,
+                    {"status": "cosign_rejected", "detail": detail},
                 )
-                if not cosign_ok:
-                    self._report_execution(
-                        approval_id,
-                        {"status": "cosign_rejected", "detail": cosign_detail},
-                    )
-                    return {
-                        "approval_id": approval_id,
-                        "symbol": symbol,
-                        "status": "cosign_rejected",
-                        "detail": cosign_detail,
-                    }
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "cosign_rejected",
+                    "detail": detail,
+                }
 
         # 3b. Fetch fresh live quote from IBKR.
         quote = self.adapter.get_quote(symbol)
@@ -959,7 +484,7 @@ class ApprovalWorker:
                 "detail": detail,
             }
 
-        # 3c. Validate fresh reference price against approved limit_price (directional adverse slippage + stale-quote sanity bound).
+        # 3c. Validate fresh reference price against approved limit_price.
         if side == "BUY":
             adverse_slippage_bps = (fresh_price - limit_price) / limit_price * 10_000.0
         else:
@@ -997,48 +522,203 @@ class ApprovalWorker:
                 "detail": detail,
             }
 
-        # 3d. Re-evaluate live portfolio through clearfills-firewall to mint a fresh single-use Ed25519 attestation.
+        # 3d. Verify Cloud-issued Ed25519 policy ticket (split-key mode) or evaluate via firewall.
         try:
             order_type = OrderType(order_type_raw)
         except ValueError:
             order_type = OrderType.LIMIT
 
-        proposal = TradeProposal(
-            agent_id=agent_id,
-            venue=_IBKR_VENUE,
-            symbol=symbol,
-            side=Side(side),
-            order_type=order_type,
-            quantity=quantity,
-            limit_price=limit_price,
-            stop_price=stop_price if (stop_price is not None and stop_price > 0) else None,
-            target_price=target_price if (target_price is not None and target_price > 0) else None,
-            reasoning_trace=reasoning_trace,
-        )
-        portfolio = self.adapter.build_portfolio_snapshot()
-        decision = self.adapter.runtime.evaluate_proposal(proposal=proposal, portfolio=portfolio)
-        if not decision.approved or decision.attestation is None:
-            detail = "; ".join(decision.reasons) if decision.reasons else ",".join(decision.reason_codes)
-            self._report_execution(
-                approval_id,
-                {
+        ticket_verifier = getattr(self.adapter.runtime, "ticket_verifier", None)
+        if ticket_verifier is not None:
+            # Hard-block immediately if kill-switch is latched.
+            if self._is_kill_switch_tripped():
+                detail = "Kill-switch is tripped (hard-blocked)."
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": ["KILL_SWITCH_TRIPPED"],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
                     "status": "firewall_denied",
-                    "detail": detail or "Denied by clearfills-firewall under live portfolio state.",
+                    "fresh_price": fresh_price,
+                    "reason_codes": ["KILL_SWITCH_TRIPPED"],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+
+            raw_ticket = (
+                record.get("policy_ticket")
+                or record.get("signed_attestation")
+                or record.get("attestation")
+            )
+            if raw_ticket is None:
+                detail = "SPLIT_KEY_TICKET_REQUIRED: Missing Cloud-issued Ed25519 policy ticket."
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": ["SPLIT_KEY_TICKET_REQUIRED"],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
+                    "reason_codes": ["SPLIT_KEY_TICKET_REQUIRED"],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+
+            try:
+                ticket = (
+                    raw_ticket
+                    if isinstance(raw_ticket, SignedAttestation)
+                    else SignedAttestation.model_validate(raw_ticket)
+                )
+            except Exception as exc:
+                detail = f"SPLIT_KEY_TICKET_INVALID: Malformed Ed25519 policy ticket ({exc})."
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": ["SPLIT_KEY_TICKET_INVALID"],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
+                    "reason_codes": ["SPLIT_KEY_TICKET_INVALID"],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+
+            raw_proposal_id = str(record.get("proposal_id") or nested.get("proposal_id") or "").strip()
+            if raw_proposal_id and raw_proposal_id != ticket.proposal_id:
+                detail = "SPLIT_KEY_TICKET_INVALID: proposal_id mismatch between record and policy ticket."
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": ["ORDER_HASH_MISMATCH"],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
+                    "reason_codes": ["ORDER_HASH_MISMATCH"],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+
+            proposal = TradeProposal(
+                proposal_id=ticket.proposal_id,
+                agent_id=agent_id,
+                venue=_IBKR_VENUE,
+                symbol=symbol,
+                side=Side(side),
+                order_type=order_type,
+                quantity=quantity,
+                limit_price=limit_price,
+                stop_price=stop_price if (stop_price is not None and stop_price > 0) else None,
+                target_price=target_price if (target_price is not None and target_price > 0) else None,
+                reasoning_trace=reasoning_trace,
+            )
+
+            ticket_ok, ticket_code = ticket_verifier.verify(attestation=ticket, proposal=proposal)
+            if not ticket_ok:
+                detail = f"Cloud Ed25519 policy ticket rejected: {ticket_code}"
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": [ticket_code],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
+                    "reason_codes": [ticket_code],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+            attestation = ticket
+        else:
+            proposal = TradeProposal(
+                agent_id=agent_id,
+                venue=_IBKR_VENUE,
+                symbol=symbol,
+                side=Side(side),
+                order_type=order_type,
+                quantity=quantity,
+                limit_price=limit_price,
+                stop_price=stop_price if (stop_price is not None and stop_price > 0) else None,
+                target_price=target_price if (target_price is not None and target_price > 0) else None,
+                reasoning_trace=reasoning_trace,
+            )
+            if self._is_kill_switch_tripped():
+                detail = "Kill-switch is tripped (hard-blocked)."
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail,
+                        "reason_codes": ["KILL_SWITCH_TRIPPED"],
+                        "reasons": [detail],
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
+                    "reason_codes": ["KILL_SWITCH_TRIPPED"],
+                    "reasons": [detail],
+                    "detail": detail,
+                }
+            portfolio = self.adapter.build_portfolio_snapshot()
+            decision = self.adapter.runtime.evaluate_proposal(proposal=proposal, portfolio=portfolio)
+            if not decision.approved or decision.attestation is None:
+                detail = "; ".join(decision.reasons) if decision.reasons else ",".join(decision.reason_codes)
+                self._report_execution(
+                    approval_id,
+                    {
+                        "status": "firewall_denied",
+                        "detail": detail or "Denied by clearfills-firewall under live portfolio state.",
+                        "reason_codes": list(decision.reason_codes),
+                        "reasons": list(decision.reasons),
+                    },
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "firewall_denied",
+                    "fresh_price": fresh_price,
                     "reason_codes": list(decision.reason_codes),
                     "reasons": list(decision.reasons),
-                },
-            )
-            return {
-                "approval_id": approval_id,
-                "symbol": symbol,
-                "status": "firewall_denied",
-                "fresh_price": fresh_price,
-                "reason_codes": list(decision.reason_codes),
-                "reasons": list(decision.reasons),
-                "detail": detail,
-            }
-
-        attestation = decision.attestation
+                    "detail": detail,
+                }
+            attestation = decision.attestation
 
         # 3e. Dry-run short-circuit: validated & attested without submitting to IBKR.
         if self.dry_run:
@@ -1052,7 +732,7 @@ class ApprovalWorker:
                 "attestation_id": attestation.attestation_id,
             }
 
-        # 3f. Submit freshly attested order to IBKR and report receipt to ClearFills Cloud.
+        # 3f. Submit freshly attested order to IBKR and report honest receipt to ClearFills Cloud.
         try:
             receipt = self.adapter.submit_attested_order(proposal=proposal, attestation=attestation)
         except (LiveExecutionSafetyError, Exception) as exc:
@@ -1081,11 +761,28 @@ class ApprovalWorker:
         receipt_dict["attestation_id"] = attestation.attestation_id
         receipt_dict["order_ids"] = list(receipt.order_ids)
         broker_order_id = str(receipt.order_ids[0]) if receipt.order_ids else None
-        fill_price = fresh_price
+
+        has_actual_fill = (
+            receipt.filled_qty > 0.0
+            and receipt.avg_fill_price is not None
+            and receipt.avg_fill_price > 0.0
+        )
+        if has_actual_fill:
+            execution_status = "filled"
+            actual_fill_price: Optional[float] = float(receipt.avg_fill_price)
+            fill_price: Optional[float] = actual_fill_price
+        else:
+            execution_status = "submitted"
+            actual_fill_price = None
+            fill_price = None
+
         report_payload = {
             "broker_order_id": broker_order_id,
+            "quoted_reference_price": fresh_price,
             "fill_price": fill_price,
-            "status": "submitted",
+            "actual_fill_price": actual_fill_price,
+            "filled_qty": receipt.filled_qty,
+            "status": execution_status,
             "receipt": receipt_dict,
         }
         self._report_execution(approval_id, report_payload)
@@ -1093,9 +790,12 @@ class ApprovalWorker:
         return {
             "approval_id": approval_id,
             "symbol": symbol,
-            "status": "submitted",
+            "status": execution_status,
             "broker_order_id": broker_order_id,
+            "quoted_reference_price": fresh_price,
             "fill_price": fill_price,
+            "actual_fill_price": actual_fill_price,
+            "filled_qty": receipt.filled_qty,
             "fresh_price": fresh_price,
             "slippage_bps": round(slippage_bps, 2),
             "attestation_id": attestation.attestation_id,
@@ -1121,10 +821,13 @@ class ApprovalWorker:
             pass
 
     def poll_once(self) -> list[dict[str, Any]]:
-        """Fetch approved IBKR orders once and process each one safely."""
+        """Monitor mark-to-market drawdown, fetch approved IBKR orders once, and process each safely."""
         now = time.monotonic()
         if self._last_heartbeat_at is None or (now - self._last_heartbeat_at) >= self._heartbeat_interval_sec:
             self.send_heartbeat()
+
+        # Check live mark-to-market drawdown on EVERY poll cycle (even with 0 pending orders).
+        self.check_drawdown_and_latch_killswitch()
 
         raw = self._cloud_request("GET", "/api/v1/cloud/approvals?status=approved")
         approvals = _extract_approvals(raw)

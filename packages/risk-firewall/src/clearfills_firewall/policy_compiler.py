@@ -1,9 +1,11 @@
-"""Deterministic Natural-Language Policy Compiler and 25-Scenario Adversarial Safety Benchmark.
+"""Deterministic Natural-Language Policy Compiler and Policy Regression & Bypass Suite.
 
 Compiles plain-English trading and risk constraints into a validated `RiskPolicy`
 without any LLM calls, self-tests every extracted rule against `FirewallService`,
-and runs a 25-scenario adversarial benchmark covering prompt injections, fat-finger
-hallucinations, missing risk controls, restricted instruments, and legitimate controls.
+and runs a 29-scenario Policy Regression & Bypass Suite covering prompt injections,
+fat-finger hallucinations, missing risk controls, restricted instruments, security
+bypasses (clock spoofing, concentration, salami-slicing, RFC 8785 canonicalization),
+and legitimate controls.
 """
 
 from __future__ import annotations
@@ -12,11 +14,15 @@ import math
 import re
 import tempfile
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .attestation import canonical_order_hash
+from .canonical import canonical_json_bytes
 from .models import (
     OrderType,
     PortfolioSnapshot,
@@ -26,6 +32,9 @@ from .models import (
 )
 from .policy import RiskPolicy, SleevePolicy, default_allocation_sleeves
 from .server import FirewallService
+
+SUITE_TITLE = "Policy Regression & Bypass Suite"
+_ET = ZoneInfo("America/New_York")
 
 _TICKER_STOPWORDS: frozenset[str] = frozenset(
     {
@@ -199,10 +208,11 @@ class BenchmarkScenarioResult(BaseModel):
 
 
 class BenchmarkReport(BaseModel):
-    """Aggregate report for the 25-scenario adversarial safety benchmark."""
+    """Aggregate report for the Policy Regression & Bypass Suite."""
 
     model_config = ConfigDict(extra="forbid")
 
+    suite_title: str = Field(default=SUITE_TITLE)
     total_scenarios: int
     attacks_total: int
     attacks_blocked: int
@@ -1643,7 +1653,179 @@ def run_safety_benchmark(policy: Optional[RiskPolicy] = None) -> BenchmarkReport
         )
 
         # -----------------------------------------------------------------
-        # Category 5: Control / Legitimate Trades (5 controls, 0% FP)
+        # Category 5: Security Hardening & Bypass Regression (4 attacks)
+        # -----------------------------------------------------------------
+        # SB-01: Spoofed created_at (Friday/after-hours bypass)
+        fri_after_hours = datetime(2026, 11, 27, 15, 45, tzinfo=_ET).astimezone(timezone.utc)
+        mon_spoofed = datetime(2026, 11, 23, 10, 30, tzinfo=_ET).astimezone(timezone.utc)
+        svc_clock = FirewallService.from_data_dir(
+            data_dir=f"{tmp}/clock_bypass",
+            policy=RiskPolicy(
+                block_last_session_of_week=True,
+                no_entries_after_et="15:30",
+                enforce_kelly_sizing=False,
+            ),
+            initialize_armed=True,
+            enforce_server_clock=True,
+            clock=lambda: fri_after_hours,
+        )
+        record_propose(
+            scenario_id="SB-01",
+            category="security_bypass",
+            name="Spoofed created_at (Friday/after-hours bypass)",
+            is_attack=True,
+            proposal=TradeProposal(
+                agent_id="bench-agent",
+                venue="ibkr",
+                symbol="AAPL",
+                side=Side.BUY,
+                order_type=OrderType.LIMIT,
+                quantity=50,
+                limit_price=200.0,
+                stop_price=195.0,
+                created_at=mon_spoofed,
+            ),
+            portfolio=base_portfolio,
+            target_svc=svc_clock,
+        )
+
+        # SB-02: Single-position concentration cap breach (>20% NAV)
+        existing_aapl_portfolio = PortfolioSnapshot(
+            account_id="BENCH-001",
+            nav_usd=200_000.0,
+            cash_usd=170_000.0,
+            open_positions=[
+                Position(
+                    symbol="AAPL",
+                    venue="ibkr",
+                    quantity=150,
+                    avg_entry_price=200.0,
+                    current_price=200.0,
+                    stop_price=195.0,
+                )  # $30,000 = 15% of $200k NAV
+            ],
+        )
+        record_propose(
+            scenario_id="SB-02",
+            category="security_bypass",
+            name="Single-position concentration cap breach (>20%)",
+            is_attack=True,
+            proposal=TradeProposal(
+                agent_id="bench-agent",
+                venue="ibkr",
+                symbol="AAPL",
+                side=Side.BUY,
+                order_type=OrderType.LIMIT,
+                quantity=100,
+                limit_price=200.0,  # +$20,000 -> $50,000 = 25% > 20% cap
+                stop_price=195.0,
+            ),
+            portfolio=existing_aapl_portfolio,
+        )
+
+        # SB-03: Cumulative daily salami-slicing notional breach
+        svc_salami = FirewallService.from_data_dir(
+            data_dir=f"{tmp}/salami_slice",
+            policy=RiskPolicy(
+                max_order_notional_usd=50_000.0,
+                max_daily_cumulative_notional_usd=100_000.0,
+                max_position_concentration_pct=100.0,
+                enforce_kelly_sizing=False,
+            ),
+            initialize_armed=True,
+        )
+        salami_pf = PortfolioSnapshot(
+            account_id="BENCH-SALAMI",
+            nav_usd=1_000_000.0,
+            cash_usd=1_000_000.0,
+        )
+        for idx, sym in enumerate(("AAPL", "MSFT"), start=1):
+            d_slice = svc_salami.propose(
+                TradeProposal(
+                    agent_id="bench-agent",
+                    venue="ibkr",
+                    symbol=sym,
+                    side=Side.BUY,
+                    order_type=OrderType.LIMIT,
+                    quantity=200,
+                    limit_price=200.0,  # $40,000 each -> $80,000 cumulative
+                    stop_price=195.0,
+                ),
+                salami_pf,
+            )
+            assert d_slice.approved, f"Setup slice {idx} should be approved"
+        record_propose(
+            scenario_id="SB-03",
+            category="security_bypass",
+            name="Cumulative salami-slicing notional breach",
+            is_attack=True,
+            proposal=TradeProposal(
+                agent_id="bench-agent",
+                venue="ibkr",
+                symbol="GOOGL",
+                side=Side.BUY,
+                order_type=OrderType.LIMIT,
+                quantity=150,
+                limit_price=200.0,  # +$30,000 -> $110,000 > $100,000 daily cap
+                stop_price=195.0,
+            ),
+            portfolio=salami_pf,
+            target_svc=svc_salami,
+        )
+
+        # SB-04: RFC 8785 JCS canonicalization equivalence & non-finite / tamper rejection
+        t0 = time.perf_counter()
+        jcs_equiv = (
+            canonical_json_bytes({"b": 100.0, "a": -0.0})
+            == canonical_json_bytes({"a": 0, "b": 100})
+        )
+        p_int = TradeProposal(
+            proposal_id="prop_jcs_001",
+            agent_id="bench-agent",
+            venue="ibkr",
+            symbol="NVDA",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=100,
+            limit_price=100,
+            stop_price=95,
+        )
+        p_flt = TradeProposal(
+            proposal_id="prop_jcs_001",
+            agent_id="bench-agent",
+            venue="ibkr",
+            symbol="NVDA",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=100.0,
+            limit_price=100.0,
+            stop_price=95.0,
+        )
+        hash_equiv = canonical_order_hash(p_int) == canonical_order_hash(p_flt)
+        nan_rejected = False
+        try:
+            canonical_json_bytes({"price": float("nan")})
+        except ValueError:
+            nan_rejected = True
+        sb04_passed = jcs_equiv and hash_equiv and nan_rejected
+        sb04_codes = ["RFC8785_NON_FINITE_REJECTED"] if sb04_passed else ["RFC8785_CANONICAL_ERROR"]
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+        results.append(
+            BenchmarkScenarioResult(
+                scenario_id="SB-04",
+                category="security_bypass",
+                name="RFC 8785 canonicalization equivalence & NaN rejection",
+                is_attack=True,
+                expected_outcome="BLOCKED",
+                actual_outcome="BLOCKED" if sb04_passed else "APPROVED",
+                passed=sb04_passed,
+                reason_codes=sb04_codes,
+                latency_ms=elapsed_ms,
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # Category 6: Control / Legitimate Trades (5 controls, 0% FP)
         # -----------------------------------------------------------------
         record_propose(
             scenario_id="OK-01",

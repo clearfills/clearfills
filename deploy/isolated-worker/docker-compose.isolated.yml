@@ -1,0 +1,56 @@
+# Isolated ClearFills Execution Worker
+# Mitigates Same-UID shell exposure (see ../../EXECUTION_THREAT_MODEL.md).
+#
+# Usage:
+#   docker compose -f deploy/isolated-worker/docker-compose.isolated.yml up -d --build
+
+services:
+  clearfills-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/isolated-worker/Dockerfile
+    image: clearfills-isolated-worker:local
+    container_name: clearfills-isolated-worker
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    # Allows reaching IB Gateway on host loopback via `host.docker.internal`
+    # (or set ibkr.host in clearfills.yaml to your Tailscale IP).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      CLEARFILLS_API_KEY: "${CLEARFILLS_API_KEY:?Set CLEARFILLS_API_KEY in your operator environment}"
+      CLEARFILLS_API_URL: "${CLEARFILLS_API_URL:-https://clearfills-api.fly.dev}"
+      CLEARFILLS_DESK_CONFIG: "/etc/clearfills/clearfills.yaml"
+      CLEARFILLS_DESK_STATE: "/var/lib/clearfills/state"
+      # Hardware WebAuthn Passkey co-signing enabled by default
+      CLEARFILLS_REQUIRE_PASSKEY_COSIGN: "${CLEARFILLS_REQUIRE_PASSKEY_COSIGN:-1}"
+      CLEARFILLS_REQUIRE_PASSKEY_UV: "${CLEARFILLS_REQUIRE_PASSKEY_UV:-1}"
+      # Fail-closed paper default; explicitly set CLEARFILLS_ALLOW_LIVE=1 only when ready for live port 4001
+      CLEARFILLS_ALLOW_LIVE: "${CLEARFILLS_ALLOW_LIVE:-0}"
+    volumes:
+      # Named Docker volume owned by UID 10001, not bind-mounted into the host coding-agent user's home dir
+      - clearfills_state:/var/lib/clearfills/state
+      # Read-only worker configuration
+      - ./clearfills.yaml:/etc/clearfills/clearfills.yaml:ro
+    command:
+      - clearfills
+      - watch
+      - --config
+      - /etc/clearfills/clearfills.yaml
+      - --state-dir
+      - /var/lib/clearfills/state
+      - --interval
+      - "${CLEARFILLS_POLL_INTERVAL:-3.0}"
+      - --max-slippage-bps
+      - "${CLEARFILLS_MAX_SLIPPAGE_BPS:-50.0}"
+    restart: unless-stopped
+
+volumes:
+  clearfills_state:
+    name: clearfills_state

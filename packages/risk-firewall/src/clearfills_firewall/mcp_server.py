@@ -47,10 +47,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "portfolio": {
                     "type": "object",
-                    "description": "PortfolioSnapshot object (account_id, nav_usd, cash_usd, daily_pnl_usd, session_entries, open_positions).",
+                    "description": "PortfolioSnapshot object (account_id, nav_usd, cash_usd, daily_pnl_usd, session_entries, open_positions). Ignored when server has a trusted PortfolioProvider configured.",
                 },
             },
-            "required": ["proposal", "portfolio"],
+            "required": ["proposal"],
         },
     },
     {
@@ -457,13 +457,20 @@ def handle_jsonrpc_request(
         if tool_name == "propose_trade":
             try:
                 proposal = TradeProposal.model_validate(arguments.get("proposal"))
-                portfolio = PortfolioSnapshot.model_validate(arguments.get("portfolio"))
+                raw_portfolio = arguments.get("portfolio")
+                if service.portfolio_provider is not None:
+                    # Authoritative server-side provider configured: ignore caller-supplied portfolio
+                    portfolio = None
+                else:
+                    portfolio = PortfolioSnapshot.model_validate(raw_portfolio)
             except (ValidationError, TypeError) as exc:
                 return _jsonrpc_result(
                     req_id,
                     _tool_result({"error": "VALIDATION_ERROR", "detail": str(exc)}, is_error=True),
                 )
-            decision = service.propose(proposal=proposal, portfolio=portfolio)
+            # Never trust caller-supplied created_at over the MCP trust boundary
+            proposal = proposal.model_copy(update={"created_at": service.now()})
+            decision = service.propose(proposal=proposal, portfolio=portfolio, force_server_clock=True)
             return _jsonrpc_result(req_id, _tool_result(decision.model_dump(mode="json")))
 
         if tool_name == "get_kill_switch_status":

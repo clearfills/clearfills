@@ -285,13 +285,13 @@ def test_pinned_operator_passkey_accepts_valid_p256_cosignature_and_blocks_repla
     assert outcomes[0]["broker_order_id"] == "4101"
 
     assert outcomes[1]["approval_id"] == "apr_hw_replay_02"
-    assert outcomes[1]["status"] == "execution_failed"
+    assert outcomes[1]["status"] == "cosign_rejected"
     assert "Operator hardware passkey co-signature verification failed" in outcomes[1]["detail"]
 
     # Only the legitimate first order reached IBKR
     assert len(mock_ib.placed) == 1
     assert reports[0][1]["status"] == "submitted"
-    assert reports[1][1]["status"] == "execution_failed"
+    assert reports[1][1]["status"] == "cosign_rejected"
 
 
 def test_pinned_operator_passkey_blocks_missing_forged_and_tampered_cloud_approvals(tmp_path: Path) -> None:
@@ -349,21 +349,21 @@ def test_pinned_operator_passkey_blocks_missing_forged_and_tampered_cloud_approv
     outcomes = worker.poll_once()
     assert len(outcomes) == 4
     for out in outcomes:
-        assert out["status"] == "execution_failed"
+        assert out["status"] == "cosign_rejected"
         assert out["detail"].startswith("Operator hardware passkey co-signature verification failed")
 
     # Zero quotes fetched and zero orders submitted to IBKR
     assert len(mock_ib.quote_calls) == 0
     assert len(mock_ib.placed) == 0
     assert len(reports) == 4
-    assert all(r[1]["status"] == "execution_failed" for r in reports)
+    assert all(r[1]["status"] == "cosign_rejected" for r in reports)
 
 
 def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_passthrough() -> None:
-    # Empty trusted_spki_keys_b64 passes through cleanly
+    # Empty trusted_spki_keys_b64 fails closed (no unpinned passthrough)
     ok, reason = verify_operator_passkey_cosignature({"approval_id": "apr_none"}, [])
-    assert ok is True
-    assert reason == "no_pinned_passkey_configured"
+    assert ok is False
+    assert "pinned" in reason.lower()
 
     priv, spki_b64 = _generate_p256_spki()
     nonce = _b64u(b"edge_case_nonce_0000000001")
@@ -401,8 +401,10 @@ def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_pa
         )
     ).decode("ascii")
     challenge = _b64u(hashlib.sha256(f"{nonce}:{approval_hash}".encode("utf-8")).digest())
-    auth_data = hashlib.sha256(b"clearfills.com").digest() + bytes([0x01]) + (7).to_bytes(4, "big")
-    client_data = json.dumps({"type": "webauthn.get", "challenge": challenge}).encode("utf-8")
+    auth_data = hashlib.sha256(b"clearfills.com").digest() + bytes([0x05]) + (7).to_bytes(4, "big")
+    client_data = json.dumps(
+        {"type": "webauthn.get", "challenge": challenge, "origin": "https://clearfills.com"}
+    ).encode("utf-8")
     rsa_sig = rsa_priv.sign(
         auth_data + hashlib.sha256(client_data).digest(),
         padding.PKCS1v15(),
@@ -422,7 +424,7 @@ def test_verify_operator_passkey_cosignature_up_bit_ceremony_rsa_and_unpinned_pa
         [rsa_spki_std_b64],
     )
     assert ok is True
-    assert reason == "ok"
+    assert "rsa" in reason.lower()
 
 
 class _UnixSignerServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

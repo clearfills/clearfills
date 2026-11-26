@@ -168,6 +168,10 @@ class PortfolioSnapshot(BaseModel):
         sym = symbol.strip().upper()
         return sum(pos.quantity for pos in self.open_positions if pos.symbol == sym)
 
+    def held_notional_usd(self, symbol: str) -> float:
+        sym = symbol.strip().upper()
+        return sum(pos.market_value_usd for pos in self.open_positions if pos.symbol == sym and pos.quantity != 0)
+
 
 class SignedAttestation(BaseModel):
     """Single-use, exact-order-hash bound, TTL-enforced Ed25519 approval token."""
@@ -218,7 +222,7 @@ class ExecutionReceipt(BaseModel):
 
 
 class AuditEntry(BaseModel):
-    """Single tamper-evident entry in the SHA-256 hash-chained audit ledger."""
+    """Single tamper-evident entry in the SHA-256 hash-chained & Ed25519-signed audit ledger."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -229,3 +233,10 @@ class AuditEntry(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     prev_hash: str = Field(..., min_length=64, max_length=64)
     entry_hash: str = Field(..., min_length=64, max_length=64)
+    entry_signature: Optional[str] = Field(default=None)
+    signer_key_id: Optional[str] = Field(default=None)
+
+    @property
+    def seq_no(self) -> int:
+        """Monotonic sequence number alias (1, 2, 3...)."""
+        return self.seq

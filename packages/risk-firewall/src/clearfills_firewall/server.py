@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,15 +21,24 @@ from .custom_guards import (
 )
 from .killswitch import KillSwitch, KillSwitchState
 from .ledger import AuditLedger
-from .models import DecisionStatus, PortfolioSnapshot, RiskDecision, SignedAttestation, TradeProposal
-from .policy import RiskPolicy, evaluate_proposal
+from .models import (
+    DecisionStatus,
+    PortfolioSnapshot,
+    RiskDecision,
+    Side,
+    SignedAttestation,
+    TradeProposal,
+    utc_now,
+)
+from .policy import RiskFirewall, RiskPolicy, evaluate_proposal
+from .providers import PortfolioProvider
 
 
 class ProposeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     proposal: TradeProposal
-    portfolio: PortfolioSnapshot
+    portfolio: Optional[PortfolioSnapshot] = None
 
 
 class DispatchCheckRequest(BaseModel):
@@ -92,13 +102,37 @@ class FirewallService:
         kill_switch: KillSwitch,
         authority: AttestationAuthority,
         ledger: AuditLedger,
+        portfolio_provider: Optional[PortfolioProvider] = None,
+        max_snapshot_age_seconds: Optional[float] = None,
+        enforce_server_clock: bool = False,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.policy = policy
         self.kill_switch = kill_switch
         self.authority = authority
         self.ledger = ledger
+        self.firewall = RiskFirewall(
+            policy=policy,
+            kill_switch=kill_switch,
+            portfolio_provider=portfolio_provider,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            enforce_server_clock=enforce_server_clock,
+            clock=clock,
+        )
         self._custom_guards: dict[str, CustomGuardFn] = {}
         self._declarative_rules: dict[str, DeclarativeGuardRule] = {}
+
+    @property
+    def portfolio_provider(self) -> Optional[PortfolioProvider]:
+        return self.firewall.portfolio_provider
+
+    @portfolio_provider.setter
+    def portfolio_provider(self, provider: Optional[PortfolioProvider]) -> None:
+        self.firewall.portfolio_provider = provider
+
+    def now(self) -> datetime:
+        """Return the authoritative server UTC timestamp."""
+        return self.firewall.now()
 
     def register_guard(self, name: str, fn: CustomGuardFn) -> None:
         """Register a deterministic Python custom guard evaluated before Ed25519 signing."""
@@ -137,6 +171,10 @@ class FirewallService:
         policy_path: Optional[str | Path] = None,
         initialize_armed: bool = False,
         ttl_seconds: int = 120,
+        portfolio_provider: Optional[PortfolioProvider] = None,
+        max_snapshot_age_seconds: Optional[float] = None,
+        enforce_server_clock: bool = False,
+        clock: Callable[[], datetime] = utc_now,
     ) -> "FirewallService":
         base = Path(data_dir)
         base.mkdir(parents=True, exist_ok=True)
@@ -157,23 +195,89 @@ class FirewallService:
             ttl_seconds=ttl_seconds,
             spent_nonces_path=base / "spent_nonces.json",
         )
-        ledger = AuditLedger(base / "audit_ledger.jsonl")
-        return cls(policy=resolved_policy, kill_switch=ks, authority=authority, ledger=ledger)
+        ledger = AuditLedger(
+            base / "audit_ledger.jsonl",
+            private_key=authority.signing_key,
+        )
+        return cls(
+            policy=resolved_policy,
+            kill_switch=ks,
+            authority=authority,
+            ledger=ledger,
+            portfolio_provider=portfolio_provider,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            enforce_server_clock=enforce_server_clock,
+            clock=clock,
+        )
 
-    def propose(self, proposal: TradeProposal, portfolio: PortfolioSnapshot) -> RiskDecision:
+    def propose(
+        self,
+        proposal: TradeProposal,
+        portfolio: Optional[PortfolioSnapshot] = None,
+        *,
+        force_server_clock: bool = False,
+    ) -> RiskDecision:
         """Evaluate proposal, issue Ed25519 attestation if approved, and append to audit ledger."""
-        decision = evaluate_proposal(
-            proposal=proposal,
-            portfolio=portfolio,
-            policy=self.policy,
-            kill_switch=self.kill_switch,
+        # Keep RiskFirewall references in sync if caller mutated service.policy / service.kill_switch
+        self.firewall.policy = self.policy
+        self.firewall.kill_switch = self.kill_switch
+
+        eval_now = self.firewall.now()
+        effective_proposal = (
+            proposal.model_copy(update={"created_at": eval_now})
+            if (self.firewall.enforce_server_clock or force_server_clock)
+            else proposal
+        )
+
+        resolved_portfolio, provider_err, provider_meta = self.firewall.resolve_portfolio(
+            portfolio, now=eval_now
+        )
+        if provider_err is not None:
+            code, reason = provider_err
+            decision = RiskDecision(
+                proposal_id=effective_proposal.proposal_id,
+                status=DecisionStatus.VETOED,
+                approved=False,
+                reason_codes=[code],
+                reasons=[reason],
+                metrics={"policy_version": self.policy.policy_version, **provider_meta},
+                evaluated_at=eval_now,
+            )
+            self.ledger.append(
+                event_type="PROPOSAL_VETOED",
+                actor=effective_proposal.agent_id,
+                payload={
+                    "decision_id": decision.decision_id,
+                    "proposal_id": effective_proposal.proposal_id,
+                    "venue": effective_proposal.venue,
+                    "symbol": effective_proposal.symbol,
+                    "side": effective_proposal.side.value,
+                    "quantity": effective_proposal.quantity,
+                    "limit_price": effective_proposal.limit_price,
+                    "stop_price": effective_proposal.stop_price,
+                    "target_price": effective_proposal.target_price,
+                    "approved": False,
+                    "reason_codes": decision.reason_codes,
+                    "attestation_id": None,
+                    "order_hash": canonical_order_hash(effective_proposal),
+                },
+            )
+            return decision
+
+        assert resolved_portfolio is not None
+        decision = self.firewall.evaluate_proposal(
+            proposal=effective_proposal,
+            portfolio=resolved_portfolio,
+            now=eval_now,
+            record_approval=False,
+            force_server_clock=False,
         )
 
         # Evaluate extensible declarative rules and Python custom guards (fail closed on error)
         custom_violations: list[GuardViolation] = []
         for rule in self._declarative_rules.values():
             try:
-                v = evaluate_declarative_rule(rule, proposal, portfolio)
+                v = evaluate_declarative_rule(rule, effective_proposal, resolved_portfolio)
                 if v is not None:
                     custom_violations.append(v)
             except Exception as exc:
@@ -187,7 +291,7 @@ class FirewallService:
 
         for gname, gfn in self._custom_guards.items():
             try:
-                res = gfn(proposal, portfolio)
+                res = gfn(effective_proposal, resolved_portfolio)
                 if isinstance(res, GuardViolation):
                     custom_violations.append(res)
                 elif isinstance(res, list):
@@ -210,25 +314,32 @@ class FirewallService:
                 decision.reasons.append(f"[{v.guard_name}] {v.reason}")
 
         if decision.approved:
-            decision.attestation = self.authority.issue(proposal)
+            held_qty = resolved_portfolio.held_quantity(effective_proposal.symbol)
+            is_reducing = effective_proposal.side == Side.SELL and held_qty >= effective_proposal.quantity
+            self.firewall.record_approved_order(
+                effective_proposal,
+                is_reducing_position=is_reducing,
+                now=eval_now,
+            )
+            decision.attestation = self.authority.issue(effective_proposal, now=eval_now)
 
         self.ledger.append(
             event_type="PROPOSAL_APPROVED" if decision.approved else "PROPOSAL_VETOED",
-            actor=proposal.agent_id,
+            actor=effective_proposal.agent_id,
             payload={
                 "decision_id": decision.decision_id,
-                "proposal_id": proposal.proposal_id,
-                "venue": proposal.venue,
-                "symbol": proposal.symbol,
-                "side": proposal.side.value,
-                "quantity": proposal.quantity,
-                "limit_price": proposal.limit_price,
-                "stop_price": proposal.stop_price,
-                "target_price": proposal.target_price,
+                "proposal_id": effective_proposal.proposal_id,
+                "venue": effective_proposal.venue,
+                "symbol": effective_proposal.symbol,
+                "side": effective_proposal.side.value,
+                "quantity": effective_proposal.quantity,
+                "limit_price": effective_proposal.limit_price,
+                "stop_price": effective_proposal.stop_price,
+                "target_price": effective_proposal.target_price,
                 "approved": decision.approved,
                 "reason_codes": decision.reason_codes,
                 "attestation_id": decision.attestation.attestation_id if decision.attestation else None,
-                "order_hash": decision.attestation.order_hash if decision.attestation else canonical_order_hash(proposal),
+                "order_hash": decision.attestation.order_hash if decision.attestation else canonical_order_hash(effective_proposal),
             },
         )
         return decision
@@ -325,7 +436,13 @@ def create_app(service: Optional[FirewallService] = None) -> "FastAPI":
 
     @app.post("/v1/propose", response_model=RiskDecision)
     def propose_trade(req: ProposeRequest) -> RiskDecision:
-        return service.propose(proposal=req.proposal, portfolio=req.portfolio)
+        # Never trust caller-supplied created_at over the HTTP trust boundary
+        server_proposal = req.proposal.model_copy(update={"created_at": service.now()})
+        return service.propose(
+            proposal=server_proposal,
+            portfolio=req.portfolio,
+            force_server_clock=True,
+        )
 
     @app.post("/v1/dispatch-check", response_model=DispatchCheckResponse)
     def dispatch_check(req: DispatchCheckRequest) -> JSONResponse:

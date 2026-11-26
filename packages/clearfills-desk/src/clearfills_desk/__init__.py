@@ -14,14 +14,27 @@ from .ibkr import (
     verify_connected_accounts,
 )
 from .mcp_server import BROKER_TOOL_DEFINITIONS, BrokerMCPServer, run_broker_stdio_server
-from .runtime import DESK_ROLES, DeskConfig, DeskRuntime, IBKRConnectionConfig
+from .runtime import (
+    DESK_ROLES,
+    DeskConfig,
+    DeskRuntime,
+    IBKRConnectionConfig,
+    SplitKeyTicketVerifier,
+)
 from .telemetry import publish_arena_heartbeat, sanitize_text
+from .webauthn_verifier import (
+    DEFAULT_WEBAUTHN_ORIGIN,
+    DEFAULT_WEBAUTHN_RP_ID,
+    canonical_order_digest,
+    compute_approval_hash,
+    verify_webauthn_assertion,
+)
 from .worker import (
     ApprovalWorker,
     CloudHTTPError,
-    compute_approval_hash,
     verify_local_webauthn_cosign,
     verify_operator_passkey_cosignature,
+    verify_webauthn_cosignature,
 )
 
 __all__ = [
@@ -29,6 +42,8 @@ __all__ = [
     "BROKER_TOOL_DEFINITIONS",
     "BrokerMCPServer",
     "CloudHTTPError",
+    "DEFAULT_WEBAUTHN_ORIGIN",
+    "DEFAULT_WEBAUTHN_RP_ID",
     "DESK_ROLES",
     "DeskConfig",
     "DeskRuntime",
@@ -42,6 +57,8 @@ __all__ = [
     "PAPER_PORTS",
     "PAPER_TAILNET_PORTS",
     "RemoteEnclaveFirewallClient",
+    "SplitKeyTicketVerifier",
+    "canonical_order_digest",
     "compute_approval_hash",
     "mask_account_id",
     "publish_arena_heartbeat",
@@ -51,4 +68,6 @@ __all__ = [
     "verify_connected_accounts",
     "verify_local_webauthn_cosign",
     "verify_operator_passkey_cosignature",
+    "verify_webauthn_assertion",
+    "verify_webauthn_cosignature",
 ]

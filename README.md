@@ -16,6 +16,7 @@ ClearFills is an open-core execution firewall and MCP server for AI trading agen
 - **Live Sandbox ($0, 60 seconds):** [https://clearfills.com/console](https://clearfills.com/console)
 - **Hosted Remote MCP (OAuth 2.1 + Bearer):** `https://clearfills-api.fly.dev/mcp`
 - **Documentation:** [clearfills.com/docs](https://clearfills.com/docs) · [docs/QUICKSTART.md](docs/QUICKSTART.md) · [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md)
+- **Security:** [EXECUTION_THREAT_MODEL.md](EXECUTION_THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [deploy/isolated-worker/](deploy/isolated-worker/)
 - **Machine-Readable Docs:** [llms.txt](https://clearfills.com/llms.txt) · [agents.txt](https://clearfills.com/agents.txt)
 
 ---
@@ -152,11 +153,30 @@ Every decision (`PROPOSAL_APPROVED`, `PROPOSAL_VETOED`, `DISPATCH_ALLOWED`, `DIS
 
 ---
 
+## What's in Open Core (Apache-2.0) vs. ClearFills Cloud
+
+| Capability | Open Core (Apache-2.0, this repo) | ClearFills Cloud (`clearfills.com`) |
+| :--- | :--- | :--- |
+| **Deterministic Risk Firewall (`clearfills_firewall`)** | Full policy engine, per-sleeve caps, hard stop-losses, kill-switch, SHA-256 + Ed25519 audit ledger | Hosted evaluation & policy sync |
+| **Cryptography & Canonicalization** | RFC 8785 (JCS) canonical order hashing, Ed25519 attestation authority & verify-only verifier | Managed policy authority & key rotation |
+| **Hardware Passkey Co-Sign Verifier** | Local WebAuthn verifier (`rpIdHash`, `origin`, `UV`, nonce-bound order hash) | Browser / mobile 1-Tap Passkey Inbox UI |
+| **Strategy Envelopes** | Deterministic multi-leg / sleeve envelope guardrails | Visual envelope builder & monitoring |
+| **Local IBKR Execution (`clearfills_desk`)** | `clearfills watch`, `clearfills sync ibkr`, `whatIf` previews, 50 bps slippage guard, `enclave_client` | Cloud approval queue & worker heartbeats |
+| **MCP & HTTP Servers** | Local stdio MCP (`clearfills mcp`, `clearfills-desk-mcp`) and FastAPI server (`clearfills serve`) | Hosted Remote MCP (`OAuth 2.1` + Bearer) |
+| **Separate-User Isolation Kit** | [`deploy/isolated-worker/`](deploy/isolated-worker/) (UID 10001 Docker + `clearfills_state` volume) | Dedicated cloud enclaves & remote checkpoint anchoring |
+| **Multi-Entity Portfolio Console** | Local YAML / CLI | Hosted Personal, Corporate, Trust, TFSA/RRSP console |
+| **Additional Broker & Prediction Venues** | IBKR Gateway (local) | Alpaca, Kalshi, Polymarket cloud adapters + SnapTrade aggregation |
+| **Out-of-Band Approval Alerts** | Local logs | Multi-channel Push, Telegram, and SMS approval alerts & signing echoes |
+| **Tax, Entity & Research Engines** | Not included | Tax, CCPC, FX, and SEC EDGAR analysis engines |
+
+---
+
 ## Repository Layout
 
 - [`src/clearfills`](src/clearfills/): Unified `clearfills` Python package & CLI (`init`, `doctor`, `mcp`, `watch`, `sync`, `validate`, `redteam`, `serve`).
-- [`packages/risk-firewall`](packages/risk-firewall/): Apache-2.0 `clearfills_firewall`, deterministic policy engine, per-sleeve rules, Ed25519 attestation authority, SHA-256 audit ledger, MCP stdio and FastAPI server.
-- [`packages/clearfills-desk`](packages/clearfills-desk/): Apache-2.0 `clearfills_desk`, IBKR execution adapter (`whatIf` previews, delayed-quote metadata, multi-agent `clientId` retry), `clearfills-desk-mcp`, `clearfills sync`, and `clearfills watch`.
+- [`packages/risk-firewall`](packages/risk-firewall/): Apache-2.0 `clearfills_firewall`, deterministic policy engine, per-sleeve rules, Ed25519 attestation authority, RFC 8785 JCS hashing, WebAuthn verifier, Strategy Envelopes, SHA-256 audit ledger, MCP stdio and FastAPI server.
+- [`packages/clearfills-desk`](packages/clearfills-desk/): Apache-2.0 `clearfills_desk`, IBKR execution adapter (`whatIf` previews, delayed-quote metadata, multi-agent `clientId` retry), `enclave_client`, `clearfills-desk-mcp`, `clearfills sync`, and `clearfills watch`.
+- [`deploy/isolated-worker/`](deploy/isolated-worker/): Separate-user Docker isolation kit (UID 10001, `0600` state volume, Passkey co-sign enabled by default).
 - [`examples/`](examples/): Runnable integration examples for `TradingAgents`, `ai-hedge-fund`, Claude, Cursor, and Codex.
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md): Concise operator guide covering Portfolio, Inbox, Rules, Lab, and live IBKR setup.
 
@@ -164,6 +184,7 @@ Every decision (`PROPOSAL_APPROVED`, `PROPOSAL_VETOED`, `DISPATCH_ALLOWED`, `DIS
 
 ## Security & Non-Custodial Guarantee
 
+- **Threat model & disclosure:** Read [`EXECUTION_THREAT_MODEL.md`](EXECUTION_THREAT_MODEL.md) (including same-UID coding agent risks, dual-key split trust, and current `v0.7/v0.8 Public Beta` audit status) and [`SECURITY.md`](SECURITY.md).
 - **Zero credential custody:** AI agents never receive brokerage or banking passwords.
 - **Fail-closed live execution:** Live IBKR requires both `ibkr.allow_live: true` in config and `CLEARFILLS_ALLOW_LIVE=1` in the execution environment, loopback/Tailscale-only transport, and a 50 bps fresh-quote slippage guard on `clearfills watch`.
 - **Software only:** ClearFills is self-directed risk engineering and execution software, not an investment advisor, custodian, or broker-dealer.

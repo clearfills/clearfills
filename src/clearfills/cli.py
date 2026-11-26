@@ -710,13 +710,21 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 _TLSN_INSTALL_HINT = (
-    "Install the real TLSNotary CLI (Rust toolchain required):\n"
+    "Note: `clearfills_arena.tlsn_prover` is an optional ClearFills Cloud / TLSNotary module "
+    "not bundled in the Apache-2.0 open-core package.\n"
+    "To generate or verify MPC-TLS proofs locally, install the TLSNotary CLI (Rust toolchain required):\n"
     "  cargo install --git https://github.com/tlsnotary/tlsn tlsn-cli\n"
     "Or place prebuilt `tlsn` / `tlsn-prover` / `tlsn-verifier` binaries in:\n"
-    "  ~/.clearfills/bin/\n"
-    "Or deploy your own TLSNotary notary server on Fly.io:\n"
-    "  cd src/deploy/tlsn-notary && fly deploy"
+    "  ~/.clearfills/bin/"
 )
+
+
+def _load_optional_tlsn_prover() -> Any | None:
+    """Dynamically load the optional ClearFills Cloud / TLSNotary helper if installed."""
+    try:
+        return importlib.import_module("clearfills_arena.tlsn_prover")
+    except ImportError:
+        return None
 
 _FALLBACK_BROKER_DEFAULTS: dict[str, tuple[str, str]] = {
     "alpaca": ("api.alpaca.markets", "/v2/orders/{order_id}"),
@@ -781,16 +789,8 @@ def _cmd_prove(args: argparse.Namespace) -> int:
 
     output_path = args.output or Path(f"{args.order_id or args.broker}.presentation.tlsn")
 
-    try:
-        from clearfills_arena.tlsn_prover import (
-            BROKER_REDACTION_PROFILES,
-            TLSNotaryBinaryNotFoundError,
-            TLSNotaryConfig,
-            TLSNotaryRunner,
-            build_http_request_bytes,
-            build_redaction_plan,
-        )
-    except ImportError:
+    tlsn_mod = _load_optional_tlsn_prover()
+    if tlsn_mod is None:
         # Standalone open-core fallback (zero extra dependencies)
         default_server, path_tpl = _FALLBACK_BROKER_DEFAULTS[args.broker]
         server_name = (args.server_name or default_server).strip().lower()
@@ -809,8 +809,9 @@ def _cmd_prove(args: argparse.Namespace) -> int:
         binary = _detect_tlsn_bin_fallback("prover", args.tlsn_bin)
         if binary is None:
             print(
-                "Error: TLSNotary prover binary (`tlsn-prover` / `tlsn`) not found on PATH "
-                "or in ~/.clearfills/bin/. ClearFills never fakes MPC-TLS proofs.\n"
+                "Error: Optional TLSNotary / Cloud module (`tlsn`) is not installed and no local "
+                "`tlsn-prover` / `tlsn` binary was found on PATH or in ~/.clearfills/bin/. "
+                "ClearFills never fakes MPC-TLS proofs.\n"
                 f"{_TLSN_INSTALL_HINT}",
                 file=sys.stderr,
             )
@@ -836,6 +837,13 @@ def _cmd_prove(args: argparse.Namespace) -> int:
             return 1
         print(f"Wrote MPC-TLS presentation: {output_path}")
         return 0
+
+    BROKER_REDACTION_PROFILES = tlsn_mod.BROKER_REDACTION_PROFILES
+    TLSNotaryBinaryNotFoundError = tlsn_mod.TLSNotaryBinaryNotFoundError
+    TLSNotaryConfig = tlsn_mod.TLSNotaryConfig
+    TLSNotaryRunner = tlsn_mod.TLSNotaryRunner
+    build_http_request_bytes = tlsn_mod.build_http_request_bytes
+    build_redaction_plan = tlsn_mod.build_redaction_plan
 
     cfg = TLSNotaryConfig(
         notary_host=args.notary_host,
@@ -1031,17 +1039,16 @@ def _cmd_verify_proof(args: argparse.Namespace) -> int:
             return 1
         trusted_pems = [args.notary_pubkey.read_text(encoding="utf-8")]
 
-    try:
-        from clearfills_arena.tlsn_prover import TLSNotaryConfig, verify_clearfills_proof_bundle
-
-        cfg = TLSNotaryConfig(tlsn_bin=str(args.tlsn_bin) if args.tlsn_bin else None)
-        report = verify_clearfills_proof_bundle(
+    tlsn_mod = _load_optional_tlsn_prover()
+    if tlsn_mod is not None:
+        cfg = tlsn_mod.TLSNotaryConfig(tlsn_bin=str(args.tlsn_bin) if args.tlsn_bin else None)
+        report = tlsn_mod.verify_clearfills_proof_bundle(
             args.proof_path,
             expected_server_name=args.server_name,
             trusted_notary_pubkeys_pem=trusted_pems,
             config=cfg,
         )
-    except ImportError:
+    else:
         # Standalone open-core fallback
         bundle = args.proof_path.expanduser().resolve()
         if not bundle.is_file():
