@@ -20,6 +20,10 @@ def test_desk_os_config_and_authoritative_firewall(tmp_path: Path) -> None:
     assert cfg.risk.block_last_session_of_week is True
     assert len(DESK_ROLES) == 6
 
+    # Disable wall-clock session cutoffs so this test is deterministic at any hour/day
+    cfg.risk.no_entries_after_et = None
+    cfg.risk.block_last_session_of_week = False
+
     rt = DeskRuntime(config=cfg, state_dir=tmp_path)
     mon_morning = datetime(2026, 11, 23, 10, 30, tzinfo=_ET).astimezone(timezone.utc)
     proposal = TradeProposal(

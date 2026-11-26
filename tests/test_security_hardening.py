@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from clearfills_firewall import (
     AuditLedger,
     FirewallService,
     KillSwitch,
+    LossSaleRecord,
     OrderType,
     PortfolioSnapshot,
     Position,
@@ -39,6 +41,7 @@ from clearfills_firewall import (
     create_app,
     handle_jsonrpc_request,
     run_policy_regression_suite,
+    run_stdio_server,
 )
 
 _ET = ZoneInfo("America/New_York")
@@ -685,3 +688,223 @@ def test_policy_regression_and_bypass_suite_all_pass() -> None:
     assert report.false_positive_rate_pct == 0.0
     assert report.audit_chain_valid is True
     assert all(r.passed for r in report.results)
+
+
+# ---------------------------------------------------------------------------
+# 6. Final Hardening: Secure Defaults, 61-Day Wash-Sale Window & Checkpoint Hook
+# ---------------------------------------------------------------------------
+
+
+def test_firewall_service_enforces_server_clock_by_default(tmp_path: Path) -> None:
+    """FirewallService MUST default to enforce_server_clock=True and ignore spoofed created_at."""
+    fri_after_hours = datetime(2026, 11, 27, 15, 45, tzinfo=_ET).astimezone(timezone.utc)
+    mon_spoofed = datetime(2026, 11, 23, 10, 30, tzinfo=_ET).astimezone(timezone.utc)
+
+    # Do NOT pass enforce_server_clock explicitly — default MUST be True
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw_default_clock",
+        policy=RiskPolicy(
+            block_last_session_of_week=True,
+            no_entries_after_et="15:30",
+            enforce_kelly_sizing=False,
+        ),
+        initialize_armed=True,
+        clock=lambda: fri_after_hours,
+    )
+    assert svc.firewall.enforce_server_clock is True
+
+    pf = PortfolioSnapshot(account_id="ACC-DEF-CLK", nav_usd=100_000.0, cash_usd=100_000.0)
+    spoofed_prop = TradeProposal(
+        agent_id="clock-spoofer",
+        venue="ibkr",
+        symbol="AAPL",
+        side=Side.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=25.0,
+        limit_price=200.0,
+        stop_price=195.0,
+        created_at=mon_spoofed,
+    )
+
+    dec = svc.propose(spoofed_prop, pf)
+    assert dec.approved is False
+    assert "LAST_SESSION_OF_WEEK_BLOCKED" in dec.reason_codes
+    assert "SESSION_CUTOFF_EXCEEDED" in dec.reason_codes
+
+
+def test_mcp_server_ignores_caller_spoofed_portfolio_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_stdio_server MUST default to SimulatedPaperPortfolioProvider and ignore caller portfolio.nav_usd."""
+    monkeypatch.delenv("CLEARFILLS_ALLOW_CALLER_PORTFOLIO", raising=False)
+    t_now = datetime(2026, 11, 24, 15, 0, 0, tzinfo=timezone.utc)
+
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw_mcp_default_provider",
+        policy=RiskPolicy(
+            max_order_notional_usd=500_000.0,
+            max_daily_cumulative_notional_usd=500_000.0,
+            max_position_concentration_pct=100.0,
+            enforce_kelly_sizing=False,
+        ),
+        initialize_armed=True,
+        clock=lambda: t_now,
+    )
+    assert svc.portfolio_provider is None
+
+    # Caller tries to spoof $10M NAV & $10M cash to buy $150k (exceeds default $100k paper portfolio)
+    spoofed_portfolio = {
+        "account_id": "SPOOFED-WHALE",
+        "nav_usd": 10_000_000.0,
+        "cash_usd": 10_000_000.0,
+        "open_positions": [],
+    }
+    oversized_proposal = {
+        "agent_id": "rogue-mcp-agent",
+        "venue": "ibkr",
+        "symbol": "AAPL",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": 750.0,
+        "limit_price": 200.0,  # $150,000 > $100,000 server-owned paper NAV/cash
+        "stop_price": 199.0,
+    }
+    req = {
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {
+            "name": "propose_trade",
+            "arguments": {"proposal": oversized_proposal, "portfolio": spoofed_portfolio},
+        },
+    }
+
+    stdin = io.StringIO(json.dumps(req) + "\n")
+    stdout = io.StringIO()
+    run_stdio_server(svc, stdin=stdin, stdout=stdout)
+
+    assert isinstance(svc.portfolio_provider, SimulatedPaperPortfolioProvider)
+    resp = json.loads(stdout.getvalue().strip())
+    dec = json.loads(resp["result"]["content"][0]["text"])
+    assert dec["approved"] is False
+    assert "INSUFFICIENT_CASH" in dec["reason_codes"]
+    assert dec["metrics"]["nav_usd"] == pytest.approx(100_000.0)
+    assert dec["metrics"]["portfolio_source"] == "trusted_provider"
+
+
+def test_real_61_day_date_based_wash_sale_window(tmp_path: Path) -> None:
+    """BUY within ±30 calendar days of a LossSaleRecord is blocked; >30 days (35 days) is allowed."""
+    now_dt = datetime(2026, 11, 25, 15, 0, 0, tzinfo=timezone.utc)
+    sale_15d_ago = now_dt - timedelta(days=15)
+    sale_35d_ago = now_dt - timedelta(days=35)
+
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw_wash_sale",
+        policy=RiskPolicy(enforce_kelly_sizing=False),
+        initialize_armed=True,
+        clock=lambda: now_dt,
+    )
+
+    pf = PortfolioSnapshot(
+        account_id="TAXABLE-MAIN",
+        nav_usd=200_000.0,
+        cash_usd=200_000.0,
+        recent_loss_sales=[
+            LossSaleRecord(
+                symbol="AAPL",
+                sold_at=sale_15d_ago,
+                realized_loss_usd=-4_250.0,
+                account_id="IRA-SPOUSE-01",
+            ),
+            LossSaleRecord(
+                symbol="MSFT",
+                sold_at=sale_35d_ago,
+                realized_loss_usd=-3_100.0,
+                account_id="TAXABLE-MAIN",
+            ),
+        ],
+    )
+
+    # AAPL sold at a loss 15 days ago -> BLOCKED with WASH_SALE_WINDOW_VIOLATION citing date & account
+    aapl_buy = TradeProposal(
+        agent_id="tax-agent",
+        venue="ibkr",
+        symbol="AAPL",
+        side=Side.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=25.0,
+        limit_price=200.0,
+        stop_price=195.0,
+    )
+    dec_aapl = svc.propose(aapl_buy, pf)
+    assert dec_aapl.approved is False
+    assert "WASH_SALE_WINDOW_VIOLATION" in dec_aapl.reason_codes
+    matching_reasons = [r for r in dec_aapl.reasons if sale_15d_ago.date().isoformat() in r and "IRA-SPOUSE-01" in r]
+    assert len(matching_reasons) == 1
+
+    # MSFT sold at a loss 35 days ago (>30d) -> ALLOWED
+    msft_buy = TradeProposal(
+        agent_id="tax-agent",
+        venue="ibkr",
+        symbol="MSFT",
+        side=Side.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=20.0,
+        limit_price=400.0,
+        stop_price=390.0,
+    )
+    dec_msft = svc.propose(msft_buy, pf)
+    assert dec_msft.approved is True
+    assert "WASH_SALE_WINDOW_VIOLATION" not in dec_msft.reason_codes
+
+
+def test_automatic_ledger_checkpoint_callback_fires_on_every_append(tmp_path: Path) -> None:
+    """AuditLedger and FirewallService.from_data_dir emit (seq_no, head_hash, head_sig) on every append."""
+    checkpoints: list[dict] = []
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw_checkpoint_hook",
+        policy=RiskPolicy(enforce_kelly_sizing=False),
+        initialize_armed=True,
+        checkpoint_callback=checkpoints.append,
+    )
+
+    pf = PortfolioSnapshot(account_id="ACC-CP", nav_usd=100_000.0, cash_usd=100_000.0)
+    prop = TradeProposal(
+        agent_id="cp-agent",
+        venue="ibkr",
+        symbol="NVDA",
+        side=Side.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=20.0,
+        limit_price=120.0,
+        stop_price=115.0,
+    )
+    dec = svc.propose(prop, pf)
+    assert dec.approved is True and dec.attestation is not None
+    svc.dispatch_check(dec.attestation, prop)
+
+    assert len(checkpoints) == 2
+    entries = svc.ledger.read_entries()
+    assert len(entries) == 2
+
+    for idx, (cp, entry) in enumerate(zip(checkpoints, entries), start=1):
+        assert cp["seq_no"] == idx == entry.seq
+        assert cp["head_hash"] == entry.entry_hash
+        assert cp["head_sig"] == entry.entry_signature
+        assert cp["head_sig"] is not None
+
+    # Failing callback must NOT corrupt or block local ledger append
+    def _broken_callback(_cp: dict) -> None:
+        raise RuntimeError("transient remote witness failure")
+
+    priv = Ed25519PrivateKey.generate()
+    resilient_ledger = AuditLedger(
+        tmp_path / "resilient.jsonl",
+        private_key=priv,
+        checkpoint_callback=_broken_callback,
+    )
+    e1 = resilient_ledger.append("TEST_EVENT", "actor-1", {"ok": True})
+    assert e1.seq_no == 1
+    ok, err, count = resilient_ledger.verify_chain(public_key_pem=resilient_ledger.public_key_pem())
+    assert ok is True and err is None and count == 1

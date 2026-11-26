@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional, TextIO
 from pydantic import ValidationError
 
 from .models import PortfolioSnapshot, TradeProposal
+from .providers import SimulatedPaperPortfolioProvider
 from .server import FirewallService
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -494,6 +495,14 @@ def run_stdio_server(
     cloud_client: Optional[CloudMCPClient] = None,
 ) -> None:
     """Run line-delimited JSON-RPC 2.0 MCP server loop over stdio."""
+    if (
+        cloud_client is None
+        and service is not None
+        and service.portfolio_provider is None
+        and os.environ.get("CLEARFILLS_ALLOW_CALLER_PORTFOLIO", "0").strip() != "1"
+    ):
+        service.portfolio_provider = SimulatedPaperPortfolioProvider(clock=service.now)
+
     for raw_line in stdin:
         line = raw_line.strip()
         if not line:
@@ -531,10 +540,13 @@ def main() -> None:
     data_dir = os.environ.get("CLEARFILLS_DATA_DIR", "./.clearfills_data")
     policy_path = os.environ.get("CLEARFILLS_POLICY_YAML")
     init_armed = os.environ.get("CLEARFILLS_INIT_ARMED", "0") == "1"
+    allow_caller_portfolio = os.environ.get("CLEARFILLS_ALLOW_CALLER_PORTFOLIO", "0").strip() == "1"
+    portfolio_provider = None if allow_caller_portfolio else SimulatedPaperPortfolioProvider()
     service = FirewallService.from_data_dir(
         data_dir=data_dir,
         policy_path=policy_path,
         initialize_armed=init_armed,
+        portfolio_provider=portfolio_provider,
     )
     run_stdio_server(service)
 

@@ -130,6 +130,7 @@ class RiskPolicy(BaseModel):
         ]
     )
     recent_loss_sale_symbols: list[str] = Field(default_factory=list)
+    wash_sale_restricted_symbols: list[str] = Field(default_factory=list)
     insider_blackout_windows: list[dict[str, str]] = Field(default_factory=list)
 
     def resolve_sleeve(self, symbol: str) -> tuple[str, Optional[SleevePolicy]]:
@@ -313,14 +314,48 @@ def evaluate_proposal(
                 f"Symbol '{proposal.symbol}' is a non-US pooled fund/ETF and triggers punitive IRS Form 8621 PFIC taxation for US tax persons outside qualified retirement accounts",
             )
 
-    # 3b-tax. IRS 30-day wash-sale / CRA superficial-loss hard veto
-    if proposal.side == Side.BUY and policy.recent_loss_sale_symbols:
-        recent_loss_symbols = {s.strip().upper() for s in policy.recent_loss_sale_symbols}
-        if prop_sym in recent_loss_symbols:
-            add_veto(
-                "SUPERFICIAL_LOSS_BLOCKED",
-                f"Buying identical security '{proposal.symbol}' within ±30 days of a realized loss sale across affiliated entities disallows the harvested capital loss under IRS wash-sale / CRA superficial-loss rules",
+    # 3b-tax. IRS 30-day wash-sale / CRA superficial-loss hard veto (61-day ±30d window)
+    if proposal.side == Side.BUY:
+        if policy.recent_loss_sale_symbols:
+            recent_loss_symbols = {s.strip().upper() for s in policy.recent_loss_sale_symbols}
+            if prop_sym in recent_loss_symbols:
+                add_veto(
+                    "SUPERFICIAL_LOSS_BLOCKED",
+                    f"Buying identical security '{proposal.symbol}' within ±30 days of a realized loss sale across affiliated entities disallows the harvested capital loss under IRS wash-sale / CRA superficial-loss rules",
+                )
+        if policy.wash_sale_restricted_symbols:
+            restricted_syms = {s.strip().upper() for s in policy.wash_sale_restricted_symbols}
+            if prop_sym in restricted_syms:
+                add_veto(
+                    "WASH_SALE_WINDOW_VIOLATION",
+                    f"Symbol '{proposal.symbol}' is restricted under wash_sale_restricted_symbols; BUY blocked to preserve harvested capital loss",
+                )
+        if portfolio.recent_loss_sales:
+            proposal_dt = (
+                proposal.created_at.replace(tzinfo=timezone.utc)
+                if proposal.created_at.tzinfo is None
+                else proposal.created_at.astimezone(timezone.utc)
             )
+            for sale in portfolio.recent_loss_sales:
+                if sale.symbol.strip().upper() != prop_sym:
+                    continue
+                sold_dt = (
+                    sale.sold_at.replace(tzinfo=timezone.utc)
+                    if sale.sold_at.tzinfo is None
+                    else sale.sold_at.astimezone(timezone.utc)
+                )
+                days_apart = abs((proposal_dt.date() - sold_dt.date()).days)
+                if days_apart <= 30:
+                    acct_label = sale.account_id or portfolio.account_id
+                    add_veto(
+                        "WASH_SALE_WINDOW_VIOLATION",
+                        (
+                            f"Buying '{proposal.symbol}' on {proposal_dt.date().isoformat()} is within the 61-day (±30d) "
+                            f"wash-sale window ({days_apart} days from realized loss sale on {sold_dt.date().isoformat()} "
+                            f"in account '{acct_label}', loss=${abs(sale.realized_loss_usd):,.2f})"
+                        ),
+                    )
+                    break
 
     # 3c-compliance. Corporate insider / MNPI trading-window blackout veto (both BUY and SELL)
     if policy.insider_blackout_windows:

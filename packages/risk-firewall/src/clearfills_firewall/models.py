@@ -112,6 +112,22 @@ class Position(BaseModel):
         return self.market_value_usd * 0.10
 
 
+class LossSaleRecord(BaseModel):
+    """Historical realized-loss sale record used for 61-day (±30d) wash-sale enforcement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(..., min_length=1, description="Ticker or security identifier sold at a loss")
+    sold_at: datetime = Field(..., description="Timestamp when the loss sale occurred")
+    realized_loss_usd: float = Field(default=0.0, description="Realized capital loss in USD")
+    account_id: str = Field(default="", description="Account identifier where the loss sale occurred")
+
+    @field_validator("symbol")
+    @classmethod
+    def _normalize_symbol(cls, v: str) -> str:
+        return v.strip().upper()
+
+
 class PortfolioSnapshot(BaseModel):
     """Point-in-time portfolio state passed into deterministic risk evaluation."""
 
@@ -123,6 +139,7 @@ class PortfolioSnapshot(BaseModel):
     daily_pnl_usd: float = Field(default=0.0, description="Realized + unrealized P&L for current trading day")
     session_entries: int = Field(default=0, ge=0, description="New entry orders already executed in current session")
     open_positions: list[Position] = Field(default_factory=list)
+    recent_loss_sales: list[LossSaleRecord] = Field(default_factory=list)
     timestamp: datetime = Field(default_factory=utc_now)
 
     @property

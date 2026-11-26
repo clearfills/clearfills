@@ -46,7 +46,12 @@ def _portfolio(*, nav: float = 500_000.0, session_entries: int = 4, daily_pnl: f
 
 
 def test_cash_equivalent_sleeve_allows_no_stop_high_notional_and_friday(tmp_path: Path) -> None:
-    svc = FirewallService.from_data_dir(tmp_path / "fw", policy=_multi_sleeve_policy(), initialize_armed=True)
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw",
+        policy=_multi_sleeve_policy(),
+        initialize_armed=True,
+        clock=lambda: _FRIDAY_ET,
+    )
     proposal = TradeProposal(
         agent_id="allocator-agent",
         venue="ibkr",
@@ -65,7 +70,12 @@ def test_cash_equivalent_sleeve_allows_no_stop_high_notional_and_friday(tmp_path
 
 
 def test_core_index_sleeve_allows_no_stop_but_enforces_sleeve_notional_cap(tmp_path: Path) -> None:
-    svc = FirewallService.from_data_dir(tmp_path / "fw", policy=_multi_sleeve_policy(), initialize_armed=True)
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw",
+        policy=_multi_sleeve_policy(),
+        initialize_armed=True,
+        clock=lambda: _FRIDAY_ET,
+    )
     ok_prop = TradeProposal(
         agent_id="allocator-agent",
         venue="ibkr",
@@ -98,7 +108,12 @@ def test_core_index_sleeve_allows_no_stop_but_enforces_sleeve_notional_cap(tmp_p
 
 
 def test_active_trading_still_enforces_strict_stop_notional_friday_and_entry_cap(tmp_path: Path) -> None:
-    svc = FirewallService.from_data_dir(tmp_path / "fw", policy=_multi_sleeve_policy(), initialize_armed=True)
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw",
+        policy=_multi_sleeve_policy(),
+        initialize_armed=True,
+        clock=lambda: _FRIDAY_ET,
+    )
     rogue = TradeProposal(
         agent_id="swing-bot",
         venue="ibkr",
@@ -120,7 +135,12 @@ def test_active_trading_still_enforces_strict_stop_notional_friday_and_entry_cap
 
 
 def test_kill_switch_and_daily_loss_still_block_all_sleeves(tmp_path: Path) -> None:
-    svc = FirewallService.from_data_dir(tmp_path / "fw", policy=_multi_sleeve_policy(), initialize_armed=True)
+    svc = FirewallService.from_data_dir(
+        tmp_path / "fw",
+        policy=_multi_sleeve_policy(),
+        initialize_armed=True,
+        clock=lambda: _FRIDAY_ET,
+    )
     proposal = TradeProposal(
         agent_id="allocator-agent",
         venue="ibkr",

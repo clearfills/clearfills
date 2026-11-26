@@ -26,7 +26,12 @@ def _make_service(tmp_path: Path, **policy_kwargs) -> FirewallService:
         enforce_kelly_sizing=False,
         **policy_kwargs,
     )
-    return FirewallService.from_data_dir(tmp_path, policy=policy, initialize_armed=True)
+    return FirewallService.from_data_dir(
+        tmp_path,
+        policy=policy,
+        initialize_armed=True,
+        enforce_server_clock=False,
+    )
 
 
 def test_session_entries_cutoff_and_friday_block(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clearfills"
-version = "0.7.0"
+version = "0.8.0"
 description = "Deterministic Ed25519 pre-trade risk firewall, MCP server, and IBKR execution guard for AI trading agents (clearfills.com)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,6 +39,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "cryptography>=42.0.0",
     "pyyaml>=6.0.0",
+    "webauthn>=2.1.0",
 ]
 
 [project.optional-dependencies]

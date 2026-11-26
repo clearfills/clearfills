@@ -28,7 +28,12 @@ def _make_service(tmp_path: Path, name: str, **policy_kwargs) -> FirewallService
         sleeves=default_allocation_sleeves(),
         **policy_kwargs,
     )
-    return FirewallService.from_data_dir(tmp_path / name, policy=policy, initialize_armed=True)
+    return FirewallService.from_data_dir(
+        tmp_path / name,
+        policy=policy,
+        initialize_armed=True,
+        enforce_server_clock=False,
+    )
 
 
 def test_pfic_hard_veto_for_us_tax_person_and_backward_compatibility(tmp_path: Path) -> None:

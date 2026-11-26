@@ -70,6 +70,7 @@ def _build_assertion(
     ceremony_type: str = "webauthn.get",
     credential_id: str = "cred_yubikey_01",
     embed_pubkey_b64: str | None = None,
+    sign_count: int = 1,
 ) -> dict[str, Any]:
     order_hash = record.get("approval_hash") or canonical_order_digest(record)
     if nonce is not None:
@@ -78,7 +79,11 @@ def _build_assertion(
         # Nonce-less challenge (must be rejected)
         challenge = _b64u(bytes.fromhex(order_hash))
 
-    auth_data = hashlib.sha256(rp_id.encode("utf-8")).digest() + bytes([flags]) + (1).to_bytes(4, "big")
+    auth_data = (
+        hashlib.sha256(rp_id.encode("utf-8")).digest()
+        + bytes([flags])
+        + int(sign_count).to_bytes(4, "big")
+    )
     client_data = json.dumps(
         {"type": ceremony_type, "challenge": challenge, "origin": origin},
         separators=(",", ":"),
@@ -596,3 +601,183 @@ def test_honest_fill_receipts_submitted_vs_actual_broker_fill(tmp_path: Path) ->
     assert reported_fill[0]["status"] == "filled"
     assert reported_fill[0]["fill_price"] == pytest.approx(100.24)
     assert reported_fill[0]["actual_fill_price"] == pytest.approx(100.24)
+
+
+# ---------------------------------------------------------------------------
+# Final Hardening Track 2: py_webauthn Delegation + signCount Rollback Protection
+# ---------------------------------------------------------------------------
+
+
+def test_py_webauthn_verifies_pinned_p256_and_rejects_sign_count_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import webauthn
+
+    priv, spki_b64 = _gen_p256()
+    base = _sample_record("apr_pywebauthn_001")
+
+    # Spy on webauthn.verify_authentication_response to prove delegation
+    calls: list[dict[str, Any]] = []
+    real_verify = webauthn.verify_authentication_response
+
+    def _spy_verify(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real_verify(**kwargs)
+
+    monkeypatch.setattr(webauthn, "verify_authentication_response", _spy_verify)
+
+    # 1. Valid pinned P-256 assertion with sign_count=10 > current_sign_count=9 succeeds
+    rec_10 = dict(base)
+    rec_10["webauthn_proof"] = _build_assertion(
+        rec_10,
+        priv,
+        nonce="nonce_sc_10",
+        rp_id="clearfills.com",
+        origin="https://clearfills.com",
+        flags=0x05,
+        credential_id="cred_yubikey_01",
+        sign_count=10,
+    )
+    res = verify_webauthn_assertion(
+        rec_10,
+        [spki_b64],
+        expected_rp_id="clearfills.com",
+        expected_origin="https://clearfills.com",
+        trusted_credential_ids=["cred_yubikey_01"],
+        current_sign_count=9,
+    )
+    ok, detail = res
+    assert ok is True
+    assert res.verified is True
+    assert res.new_sign_count == 10
+    assert res.credential_id == "cred_yubikey_01"
+    assert res.user_verified is True
+    assert "py_webauthn" in detail.lower()
+    assert len(calls) == 1
+    assert calls[0]["require_user_verification"] is True
+    assert calls[0]["credential_current_sign_count"] == 9
+    assert calls[0]["expected_rp_id"] == "clearfills.com"
+    assert calls[0]["expected_origin"] == "https://clearfills.com"
+
+    # 2. Equal sign_count (10 <= 10) rejected as cloned authenticator / rollback
+    res_eq = verify_webauthn_assertion(
+        rec_10,
+        [spki_b64],
+        expected_rp_id="clearfills.com",
+        expected_origin="https://clearfills.com",
+        current_sign_count=10,
+    )
+    assert res_eq.verified is False
+    assert "sign_count" in res_eq.detail.lower() or "cloned" in res_eq.detail.lower()
+
+    # 3. Lower sign_count (7 <= 10) rejected as cloned authenticator / rollback
+    rec_7 = dict(base)
+    rec_7["webauthn_proof"] = _build_assertion(
+        rec_7,
+        priv,
+        nonce="nonce_sc_7",
+        credential_id="cred_yubikey_01",
+        sign_count=7,
+    )
+    res_low = verify_webauthn_assertion(
+        rec_7,
+        [spki_b64],
+        current_sign_count=10,
+    )
+    assert res_low.verified is False
+    assert "sign_count" in res_low.detail.lower() or "cloned" in res_low.detail.lower()
+
+
+def test_worker_persists_passkey_sign_counts_atomically_0600_and_blocks_rollback(
+    tmp_path: Path,
+) -> None:
+    priv, spki_b64 = _gen_p256()
+    state_dir = tmp_path / "sign_count_state"
+    cfg = DeskConfig(
+        desk_id="sign-count-desk",
+        desk_name="Sign Count Desk",
+        execution_mode="paper",
+        ibkr=IBKRConnectionConfig(host="127.0.0.1", port=4002, account_id="DU1234567", allow_live=False),
+        risk=RiskPolicy(sleeves=default_allocation_sleeves()),
+    )
+    ib = _ConfigurableIB(accounts=["DU1234567"])
+    adapter = IBKRExecutionAdapter(DeskRuntime(cfg, state_dir=state_dir), ib_client=ib, env={})
+
+    # Order 1: sign_count = 5 -> accepted, persisted to passkey_sign_counts.json (0600)
+    rec1 = _sample_record("apr_sc_01")
+    rec1["webauthn_proof"] = _build_assertion(
+        rec1, priv, nonce="nonce_w_01", credential_id="cred_yk_prod", sign_count=5
+    )
+    reported1: list[dict[str, Any]] = []
+    worker1 = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test",
+        cloud_transport=_make_transport([rec1], reported1),
+        trusted_passkey_spki_b64=[spki_b64],
+        trusted_credential_ids=["cred_yk_prod"],
+    )
+    out1 = worker1.poll_once()
+    assert len(out1) == 1
+    assert out1[0]["status"] == "submitted"
+    assert len(ib.placed) == 1
+
+    sc_path = state_dir / "passkey_sign_counts.json"
+    assert sc_path.exists()
+    assert (sc_path.stat().st_mode & 0o777) == 0o600
+    assert json.loads(sc_path.read_text(encoding="utf-8")) == {"cred_yk_prod": 5}
+
+    # Order 2 (fresh worker instance simulating restart): sign_count = 5 (cloned/rollback) -> REJECTED
+    rec2_rollback = _sample_record("apr_sc_02_rollback")
+    rec2_rollback["webauthn_proof"] = _build_assertion(
+        rec2_rollback, priv, nonce="nonce_w_02", credential_id="cred_yk_prod", sign_count=5
+    )
+    reported2: list[dict[str, Any]] = []
+    worker2 = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test",
+        cloud_transport=_make_transport([rec2_rollback], reported2),
+        trusted_passkey_spki_b64=[spki_b64],
+        trusted_credential_ids=["cred_yk_prod"],
+    )
+    out2 = worker2.poll_once()
+    assert len(out2) == 1
+    assert out2[0]["status"] == "cosign_rejected"
+    assert "sign_count" in out2[0]["detail"].lower() or "cloned" in out2[0]["detail"].lower()
+    assert len(ib.placed) == 1
+    assert json.loads(sc_path.read_text(encoding="utf-8")) == {"cred_yk_prod": 5}
+
+    # Order 3: sign_count = 3 (strictly lower rollback) -> REJECTED
+    rec3_lower = _sample_record("apr_sc_03_lower")
+    rec3_lower["webauthn_proof"] = _build_assertion(
+        rec3_lower, priv, nonce="nonce_w_03", credential_id="cred_yk_prod", sign_count=3
+    )
+    worker3 = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test",
+        cloud_transport=_make_transport([rec3_lower], []),
+        trusted_passkey_spki_b64=[spki_b64],
+        trusted_credential_ids=["cred_yk_prod"],
+    )
+    out3 = worker3.poll_once()
+    assert len(out3) == 1
+    assert out3[0]["status"] == "cosign_rejected"
+    assert len(ib.placed) == 1
+
+    # Order 4: sign_count = 6 (monotonic increment) -> ACCEPTED and persisted as 6
+    rec4_inc = _sample_record("apr_sc_04_inc")
+    rec4_inc["webauthn_proof"] = _build_assertion(
+        rec4_inc, priv, nonce="nonce_w_04", credential_id="cred_yk_prod", sign_count=6
+    )
+    worker4 = ApprovalWorker(
+        adapter=adapter,
+        api_key="cf_test",
+        cloud_transport=_make_transport([rec4_inc], []),
+        trusted_passkey_spki_b64=[spki_b64],
+        trusted_credential_ids=["cred_yk_prod"],
+    )
+    out4 = worker4.poll_once()
+    assert len(out4) == 1
+    assert out4[0]["status"] == "submitted"
+    assert len(ib.placed) == 2
+    assert json.loads(sc_path.read_text(encoding="utf-8")) == {"cred_yk_prod": 6}
+    assert (sc_path.stat().st_mode & 0o777) == 0o600

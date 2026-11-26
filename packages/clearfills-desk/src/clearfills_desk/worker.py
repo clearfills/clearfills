@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Optional, TextIO
 
 from clearfills_firewall import KillSwitch, OrderType, Side, SignedAttestation, TradeProposal
@@ -32,9 +33,11 @@ from .telemetry import sanitize_text
 from .webauthn_verifier import (
     DEFAULT_WEBAUTHN_ORIGIN,
     DEFAULT_WEBAUTHN_RP_ID,
+    WebAuthnVerificationResult,
     canonical_order_digest,
     compute_approval_hash,
     extract_client_challenge,
+    extract_credential_id,
     extract_webauthn_assertion,
     verify_webauthn_assertion,
 )
@@ -112,7 +115,8 @@ def verify_operator_passkey_cosignature(
     expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
-) -> tuple[bool, str]:
+    current_sign_count: int = 0,
+) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier."""
     return verify_webauthn_assertion(
         record,
@@ -120,6 +124,7 @@ def verify_operator_passkey_cosignature(
         expected_rp_id=expected_rp_id,
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
+        current_sign_count=current_sign_count,
     )
 
 
@@ -130,7 +135,8 @@ def verify_local_webauthn_cosign(
     expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
-) -> tuple[bool, str]:
+    current_sign_count: int = 0,
+) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier."""
     return verify_webauthn_assertion(
         record,
@@ -138,6 +144,7 @@ def verify_local_webauthn_cosign(
         expected_rp_id=expected_rp_id,
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
+        current_sign_count=current_sign_count,
     )
 
 
@@ -149,7 +156,8 @@ def verify_webauthn_cosignature(
     expected_rp_id: str = DEFAULT_WEBAUTHN_RP_ID,
     expected_origin: str = DEFAULT_WEBAUTHN_ORIGIN,
     trusted_credential_ids: Optional[list[str]] = None,
-) -> tuple[bool, str]:
+    current_sign_count: int = 0,
+) -> WebAuthnVerificationResult:
     """Delegate to the single canonical fail-closed WebAuthn verifier.
 
     Note: `UV` (User Verified) and locally pinned keys are ALWAYS strictly required.
@@ -161,6 +169,7 @@ def verify_webauthn_cosignature(
         expected_rp_id=expected_rp_id,
         expected_origin=expected_origin,
         trusted_credential_ids=trusted_credential_ids,
+        current_sign_count=current_sign_count,
     )
 
 
@@ -305,6 +314,38 @@ class ApprovalWorker:
             return last
         return None
 
+    def _sign_counts_path(self) -> Path:
+        return Path(self.adapter.runtime.state_dir) / "passkey_sign_counts.json"
+
+    def _load_passkey_sign_counts(self) -> dict[str, int]:
+        path = self._sign_counts_path()
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("passkey_sign_counts.json must be a JSON object.")
+        counts: dict[str, int] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError("passkey_sign_counts.json contains invalid sign_count entries.")
+            counts[k] = v
+        return counts
+
+    def _save_passkey_sign_counts(self, counts: dict[str, int]) -> None:
+        path = self._sign_counts_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(counts, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+        tmp_path = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+        os.chmod(path, 0o600)
+
     def _get_latchable_kill_switch(self) -> KillSwitch:
         fw_ks = getattr(self.adapter.runtime.firewall, "kill_switch", None)
         if isinstance(fw_ks, KillSwitch):
@@ -438,19 +479,56 @@ class ApprovalWorker:
                     "detail": detail,
                 }
 
-            cosign_ok, cosign_detail = verify_webauthn_assertion(
+            if assertion is not None:
+                ch = extract_client_challenge(assertion)
+                if ch and ch in self._used_passkey_challenges:
+                    detail = (
+                        "Operator hardware passkey co-signature verification failed: "
+                        "Replayed WebAuthn passkey challenge rejected by local worker."
+                    )
+                    self._report_execution(
+                        approval_id,
+                        {"status": "cosign_rejected", "detail": detail},
+                    )
+                    return {
+                        "approval_id": approval_id,
+                        "symbol": symbol,
+                        "status": "cosign_rejected",
+                        "detail": detail,
+                    }
+
+            sign_count_key = (extract_credential_id(assertion) if assertion is not None else "") or "__default__"
+            try:
+                sign_counts = self._load_passkey_sign_counts()
+            except Exception as exc:
+                detail = (
+                    "Operator hardware passkey co-signature verification failed: "
+                    f"Corrupted passkey_sign_counts.json state (fail-closed): {exc}"
+                )
+                self._report_execution(
+                    approval_id,
+                    {"status": "cosign_rejected", "detail": detail},
+                )
+                return {
+                    "approval_id": approval_id,
+                    "symbol": symbol,
+                    "status": "cosign_rejected",
+                    "detail": detail,
+                }
+
+            current_sign_count = sign_counts.get(sign_count_key, 0)
+            cosign_result = verify_webauthn_assertion(
                 record,
                 combined_pinned_keys,
                 expected_rp_id=self._webauthn_rp_id,
                 expected_origin=self._webauthn_origin,
                 trusted_credential_ids=self._trusted_credential_ids or None,
+                current_sign_count=current_sign_count,
             )
+            cosign_ok, cosign_detail = cosign_result
             if cosign_ok and assertion is not None:
                 ch = extract_client_challenge(assertion)
-                if ch and ch in self._used_passkey_challenges:
-                    cosign_ok = False
-                    cosign_detail = "Replayed WebAuthn passkey challenge rejected by local worker."
-                elif ch:
+                if ch:
                     used_cosign_challenge = ch
 
             if not cosign_ok:
@@ -465,6 +543,10 @@ class ApprovalWorker:
                     "status": "cosign_rejected",
                     "detail": detail,
                 }
+
+            if cosign_result.new_sign_count is not None and not self.dry_run:
+                sign_counts[sign_count_key] = cosign_result.new_sign_count
+                self._save_passkey_sign_counts(sign_counts)
 
         # 3b. Fetch fresh live quote from IBKR.
         quote = self.adapter.get_quote(symbol)

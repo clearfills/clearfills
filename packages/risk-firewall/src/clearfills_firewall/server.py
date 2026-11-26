@@ -104,7 +104,7 @@ class FirewallService:
         ledger: AuditLedger,
         portfolio_provider: Optional[PortfolioProvider] = None,
         max_snapshot_age_seconds: Optional[float] = None,
-        enforce_server_clock: bool = False,
+        enforce_server_clock: bool = True,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.policy = policy
@@ -173,8 +173,10 @@ class FirewallService:
         ttl_seconds: int = 120,
         portfolio_provider: Optional[PortfolioProvider] = None,
         max_snapshot_age_seconds: Optional[float] = None,
-        enforce_server_clock: bool = False,
+        enforce_server_clock: bool = True,
         clock: Callable[[], datetime] = utc_now,
+        checkpoint_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        checkpoint_webhook_url: Optional[str] = None,
     ) -> "FirewallService":
         base = Path(data_dir)
         base.mkdir(parents=True, exist_ok=True)
@@ -195,9 +197,16 @@ class FirewallService:
             ttl_seconds=ttl_seconds,
             spent_nonces_path=base / "spent_nonces.json",
         )
+        resolved_webhook_url = (
+            checkpoint_webhook_url
+            if checkpoint_webhook_url is not None
+            else (os.environ.get("CLEARFILLS_LEDGER_CHECKPOINT_URL", "").strip() or None)
+        )
         ledger = AuditLedger(
             base / "audit_ledger.jsonl",
             private_key=authority.signing_key,
+            checkpoint_callback=checkpoint_callback,
+            checkpoint_webhook_url=resolved_webhook_url,
         )
         return cls(
             policy=resolved_policy,

@@ -25,8 +25,10 @@ from .telemetry import publish_arena_heartbeat, sanitize_text
 from .webauthn_verifier import (
     DEFAULT_WEBAUTHN_ORIGIN,
     DEFAULT_WEBAUTHN_RP_ID,
+    WebAuthnVerificationResult,
     canonical_order_digest,
     compute_approval_hash,
+    spki_public_key_to_cose,
     verify_webauthn_assertion,
 )
 from .worker import (
@@ -58,12 +60,14 @@ __all__ = [
     "PAPER_TAILNET_PORTS",
     "RemoteEnclaveFirewallClient",
     "SplitKeyTicketVerifier",
+    "WebAuthnVerificationResult",
     "canonical_order_digest",
     "compute_approval_hash",
     "mask_account_id",
     "publish_arena_heartbeat",
     "run_broker_stdio_server",
     "sanitize_text",
+    "spki_public_key_to_cose",
     "validate_ibkr_connection",
     "verify_connected_accounts",
     "verify_local_webauthn_cosign",

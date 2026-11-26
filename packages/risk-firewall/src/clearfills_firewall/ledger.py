@@ -10,11 +10,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -29,6 +32,7 @@ from .canonical import canonical_json_bytes
 from .models import AuditEntry, utc_now
 
 GENESIS_HASH = "0" * 64
+logger = logging.getLogger(__name__)
 
 
 def _compute_entry_hash(
@@ -97,6 +101,8 @@ class AuditLedger:
         ledger_path: str | Path,
         *,
         private_key: Optional[Ed25519PrivateKey | bytes | str] = None,
+        checkpoint_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        checkpoint_webhook_url: Optional[str] = None,
     ) -> None:
         self._path = Path(ledger_path)
         self._lock = threading.Lock()
@@ -107,6 +113,10 @@ class AuditLedger:
         )
         self._signer_key_id: Optional[str] = (
             _key_id_for_public_key(self._public_key) if self._public_key is not None else None
+        )
+        self._checkpoint_callback = checkpoint_callback
+        self._checkpoint_webhook_url = (
+            checkpoint_webhook_url.strip() if checkpoint_webhook_url and checkpoint_webhook_url.strip() else None
         )
 
     @property
@@ -172,7 +182,43 @@ class AuditLedger:
                 fh.write(line)
                 fh.flush()
                 os.fsync(fh.fileno())
-            return entry
+            checkpoint = {
+                "seq_no": entry.seq,
+                "head_hash": entry.entry_hash,
+                "head_sig": entry.entry_signature,
+                "signer_key_id": entry.signer_key_id,
+            }
+
+        self._emit_checkpoint(checkpoint)
+        return entry
+
+    def _emit_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Emit an out-of-band ledger checkpoint to configured callback and/or webhook."""
+        if self._checkpoint_callback is not None:
+            try:
+                self._checkpoint_callback(dict(checkpoint))
+            except Exception as exc:
+                logger.warning("AuditLedger checkpoint_callback failed: %s", exc)
+
+        if self._checkpoint_webhook_url is not None:
+            url = self._checkpoint_webhook_url
+            payload_bytes = json.dumps(checkpoint).encode("utf-8")
+
+            def _post_webhook() -> None:
+                req = urllib.request.Request(
+                    url,
+                    data=payload_bytes,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        resp.read()
+                except Exception as exc:
+                    logger.warning("AuditLedger checkpoint webhook (%s) failed: %s", url, exc)
+
+            thread = threading.Thread(target=_post_webhook, daemon=True)
+            thread.start()
 
     def get_checkpoint(self) -> dict[str, Any]:
         """Return the current ledger head checkpoint (`seq_no`, `head_hash`, `head_sig`)."""
